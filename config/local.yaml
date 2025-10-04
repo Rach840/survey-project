@@ -1,0 +1,6 @@
+env: "local"
+bot: 
+  token: "8401985729:AAErrXZSitUzRNWsIzEbWG8dsdvwWW8kNnY"
+rest: 
+  port: "8080"
+
