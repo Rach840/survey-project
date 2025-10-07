@@ -1,6 +1,0 @@
-env: "local"
-bot: 
-  token: "8401985729:AAErrXZSitUzRNWsIzEbWG8dsdvwWW8kNnY"
-rest: 
-  port: "8080"
-database_url: "postgres://gen_user:password@185.171.82.159:5432/questionnaires?sslmode=disable"
