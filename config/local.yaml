@@ -1,0 +1,8 @@
+env: "local"
+bot: 
+  token: "8401985729:AAErrXZSitUzRNWsIzEbWG8dsdvwWW8kNnY"
+jwt:
+  secret: "997a36ab3e07b48ae8b0b47cf2b92be094be826c53a662b7ca1e00b2de14b9bb"
+rest: 
+  port: "8080"
+database_url: "postgresql://gen_user:password@185.171.82.159:5432/questionnaires?sslmode=disable"
