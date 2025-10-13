@@ -2,6 +2,7 @@ package httptransport
 
 import (
 	"mymodule/internal/config"
+	"mymodule/internal/httpx"
 	"mymodule/internal/service"
 	"mymodule/internal/storage/providers"
 	"net/http"
@@ -15,7 +16,9 @@ func Router(db *pgxpool.Pool, cfg *config.Config) *mux.Router {
 
 	allProviders := providers.New(db)
 	authService := service.NewAuthService(allProviders.AuthProvider, cfg.JWT.Secret)
+	templateService := service.NewTemplateService(allProviders.TemplateProvider)
 	authHandler := NewAuthHandlers(authService)
+	templateHandler := NewTemplateHandlers(templateService)
 
 	api := router.PathPrefix("/api").Subrouter()
 
@@ -25,5 +28,10 @@ func Router(db *pgxpool.Pool, cfg *config.Config) *mux.Router {
 	auth.HandleFunc("/refresh", authHandler.Refresh).Methods(http.MethodPost)
 	auth.HandleFunc("/me", authHandler.Me).Methods(http.MethodGet)
 
+	template := api.PathPrefix("/template").Subrouter()
+	template.Use(httpx.Protected(cfg.JWT.Secret))
+	template.Use(httpx.Questioner(*allProviders.AuthProvider))
+	template.HandleFunc("/create", templateHandler.CreateTemplate).Methods(http.MethodPost)
+	template.HandleFunc("/getAllByUser", templateHandler.GetAllTemplatesByUser).Methods(http.MethodGet)
 	return router
 }

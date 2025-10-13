@@ -77,13 +77,14 @@ func (srv AuthHandlers) Login(w http.ResponseWriter, r *http.Request) {
 	return
 }
 func (s AuthHandlers) Refresh(w http.ResponseWriter, r *http.Request) {
-	tokenByCookie, err := r.Cookie("refreshToken")
-	if err != nil || tokenByCookie.Value == "" {
+	req, err := httpx.ReadBody[TokenRefreshRequest](*r)
+	if err != nil || req.RefreshToken == "" {
+		slog.Info("refreshToken cookie not exist")
 		httpx.Error(w, http.StatusBadRequest, "Refresh token is required")
 		return
 	}
-
-	accessToken, refreshToken, err := s.service.Refresh(r.Context(), tokenByCookie.Value)
+	slog.Info(req.RefreshToken)
+	accessToken, refreshToken, err := s.service.Refresh(r.Context(), req.RefreshToken)
 
 	if err != nil {
 		if errors.Is(err, service.TokenIncorrect) {
@@ -99,11 +100,12 @@ func (s AuthHandlers) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 
 	}
+	slog.Info(accessToken)
 	httpx.JSON(w, http.StatusOK, struct {
-		accessToken  string
-		refreshToken string
-	}{accessToken, refreshToken})
-	w.WriteHeader(http.StatusOK)
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}{AccessToken: accessToken, RefreshToken: refreshToken})
+
 	return
 }
 
