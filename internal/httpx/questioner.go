@@ -23,7 +23,6 @@ func Questioner(provider providers.AuthProvider) mux.MiddlewareFunc {
 				return
 			}
 			user, err := provider.GetUserByID(r.Context(), sub)
-			slog.Info("user: %v", user)
 			if err != nil {
 				Error(w, http.StatusUnauthorized, "Unauthorized")
 				return

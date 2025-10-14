@@ -32,6 +32,9 @@ func Router(db *pgxpool.Pool, cfg *config.Config) *mux.Router {
 	template.Use(httpx.Protected(cfg.JWT.Secret))
 	template.Use(httpx.Questioner(*allProviders.AuthProvider))
 	template.HandleFunc("/create", templateHandler.CreateTemplate).Methods(http.MethodPost)
-	template.HandleFunc("/getAllByUser", templateHandler.GetAllTemplatesByUser).Methods(http.MethodGet)
+	template.HandleFunc("/", templateHandler.GetAllTemplatesByUser).Methods(http.MethodGet)
+	template.HandleFunc("/{id}", templateHandler.GetTemplateById).Methods(http.MethodGet)
+	template.HandleFunc("/{id}", templateHandler.UpdateTemplate).Methods(http.MethodPatch)
+
 	return router
 }

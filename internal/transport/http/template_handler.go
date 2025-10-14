@@ -8,6 +8,9 @@ import (
 	"mymodule/internal/httpx"
 	"mymodule/internal/storage"
 	"net/http"
+	"strconv"
+
+	"github.com/gorilla/mux"
 )
 
 type TemplateHandlers struct {
@@ -15,7 +18,9 @@ type TemplateHandlers struct {
 }
 type TemplateServices interface {
 	CreateTemplate(ctx context.Context, template domains.TemplateCreate, userId int) error
+	UpdateTemplate(ctx context.Context, templateId int, template domains.TemplateCreate, userId int) error
 	GetAllTemplatesByUser(ctx context.Context, userId int) ([]domains.Template, error)
+	GetTemplateById(ctx context.Context, userId int, templateId int) (domains.Template, error)
 }
 
 func NewTemplateHandlers(service TemplateServices) *TemplateHandlers {
@@ -68,5 +73,49 @@ func (h *TemplateHandlers) GetAllTemplatesByUser(w http.ResponseWriter, r *http.
 	}
 	slog.Info("get all templates by user", user, templates)
 	httpx.JSON(w, http.StatusOK, templates)
+	return
+}
+func (h *TemplateHandlers) GetTemplateById(w http.ResponseWriter, r *http.Request) {
+	idStr := mux.Vars(r)["id"]
+	templateIDInt, err := strconv.ParseInt(idStr, 10, 64)
+	user, ok := httpx.UserIdFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	ctx := r.Context()
+	templates, err := h.service.GetTemplateById(ctx, user, int(templateIDInt))
+	if err != nil {
+		http.Error(w, "Ошибка", http.StatusInternalServerError)
+		return
+	}
+	slog.Info("get all templates by user", user, templates)
+	httpx.JSON(w, http.StatusOK, templates)
+	return
+}
+func (h *TemplateHandlers) UpdateTemplate(w http.ResponseWriter, r *http.Request) {
+	idStr := mux.Vars(r)["id"]
+	templateIDInt, err := strconv.ParseInt(idStr, 10, 64)
+	user, ok := httpx.UserIdFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	templateData, err := httpx.ReadBody[domains.TemplateCreate](*r)
+	if err != nil {
+		slog.Error("UpdateTemplate read template err", err)
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(err.Error()))
+		return
+	}
+	ctx := r.Context()
+
+	if err := h.service.UpdateTemplate(ctx, int(templateIDInt), templateData, user); err != nil {
+		http.Error(w, "Ошибка", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
 	return
 }
