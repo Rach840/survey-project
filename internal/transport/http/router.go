@@ -17,8 +17,10 @@ func Router(db *pgxpool.Pool, cfg *config.Config) *mux.Router {
 	allProviders := providers.New(db)
 	authService := service.NewAuthService(allProviders.AuthProvider, cfg.JWT.Secret)
 	templateService := service.NewTemplateService(allProviders.TemplateProvider)
+	surveyService := service.NewSurveyService(allProviders.SurveyProvider, allProviders.TemplateProvider, cfg.JWT.Secret)
 	authHandler := NewAuthHandlers(authService)
 	templateHandler := NewTemplateHandlers(templateService)
+	surveyHandler := NewSurveyHandlers(surveyService)
 
 	api := router.PathPrefix("/api").Subrouter()
 
@@ -35,6 +37,16 @@ func Router(db *pgxpool.Pool, cfg *config.Config) *mux.Router {
 	template.HandleFunc("/", templateHandler.GetAllTemplatesByUser).Methods(http.MethodGet)
 	template.HandleFunc("/{id}", templateHandler.GetTemplateById).Methods(http.MethodGet)
 	template.HandleFunc("/{id}", templateHandler.UpdateTemplate).Methods(http.MethodPatch)
+
+	surveyPublic := api.PathPrefix("/survey").Subrouter()
+	surveyPublic.HandleFunc("/access", surveyHandler.AccessSurveyByToken).Methods(http.MethodPost, http.MethodGet)
+
+	survey := api.PathPrefix("/survey").Subrouter()
+	survey.Use(httpx.Protected(cfg.JWT.Secret))
+	survey.Use(httpx.Questioner(*allProviders.AuthProvider))
+	survey.HandleFunc("/create", surveyHandler.CreateSurvey).Methods(http.MethodPost)
+	survey.HandleFunc("/", surveyHandler.GetAllSurveysByUser).Methods(http.MethodGet)
+	survey.HandleFunc("/{id}", surveyHandler.GetSurveyById).Methods(http.MethodGet)
 
 	return router
 }
