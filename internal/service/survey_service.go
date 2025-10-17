@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"mymodule/internal/domains"
+	"mymodule/internal/storage"
 
 	"github.com/dgrijalva/jwt-go"
 )
@@ -26,7 +27,11 @@ type SurveyProvider interface {
 	SaveSurvey(ctx context.Context, survey domains.SurveyToSave, generator domains.EnrollmentTokenGenerator) (domains.Survey, []domains.EnrollmentInvitation, error)
 	GetAllSurveysByUser(ctx context.Context, userId int64) ([]domains.Survey, error)
 	GetSurveyByID(ctx context.Context, ownerID int64, surveyID int64) (domains.Survey, error)
-	GetSurveyAccessByHash(ctx context.Context, hash []byte) (domains.SurveyAccess, error)
+	GetSurveyAccessByHash(ctx context.Context, id int) (domains.SurveyAccess, error)
+	ListEnrollmentsBySurveyID(ctx context.Context, ownerID int64, surveyID int64) ([]domains.Enrollment, error)
+	UpdateEnrollmentToken(ctx context.Context, enrollmentID int64, hash []byte, expiresAt time.Time) error
+	SubmitSurveyResponse(ctx context.Context, payload domains.SurveyResponseToSave) (domains.SurveyResponseResult, error)
+	GetSurveyResultByEnrollmentID(ctx context.Context, enrollmentID int64) (domains.SurveyResponseResult, error)
 }
 
 func NewSurveyService(provider SurveyProvider, templates TemplateProvider, secret string) *SurveyService {
@@ -99,16 +104,165 @@ func (h *SurveyService) GetAllSurveysByUser(ctx context.Context, userId int) ([]
 	return surveys, nil
 }
 
-func (h *SurveyService) GetSurveyById(ctx context.Context, userId int, surveyId int) (domains.Survey, error) {
+func (h *SurveyService) GetSurveyById(ctx context.Context, userId int, surveyId int) (domains.SurveyDetails, error) {
 	survey, err := h.provider.GetSurveyByID(ctx, int64(userId), int64(surveyId))
 	if err != nil {
 		slog.Error("GetSurveyById failed", "err", err, "user_id", userId, "survey_id", surveyId)
-		return domains.Survey{}, err
+		return domains.SurveyDetails{}, err
 	}
-	return survey, nil
+
+	enrollments, err := h.provider.ListEnrollmentsBySurveyID(ctx, int64(userId), int64(surveyId))
+	if err != nil {
+		slog.Error("ListEnrollmentsBySurveyID failed", "err", err, "user_id", userId, "survey_id", surveyId)
+		return domains.SurveyDetails{}, err
+	}
+
+	invitations := make([]domains.EnrollmentInvitation, 0, len(enrollments))
+	for _, enrollment := range enrollments {
+		if !isEnrollmentTokenAllowed(enrollment.State) {
+			continue
+		}
+
+		payload := domains.EnrollmentTokenPayload{
+			SurveyID:     survey.ID,
+			EnrollmentID: enrollment.ID,
+			OwnerID:      survey.OwnerID,
+			Enrollment: domains.EnrollmentCreate{
+				FullName:       enrollment.FullName,
+				Email:          enrollment.Email,
+				Phone:          enrollment.Phone,
+				TelegramChatID: enrollment.TelegramChatID,
+			},
+		}
+		token, hash, expiresAt, err := h.buildToken(payload)
+		if err != nil {
+			slog.Error("buildToken failed", "err", err, "enrollment_id", enrollment.ID)
+			return domains.SurveyDetails{}, err
+		}
+
+		if err := h.provider.UpdateEnrollmentToken(ctx, enrollment.ID, hash, expiresAt); err != nil {
+			slog.Error("UpdateEnrollmentToken failed", "err", err, "enrollment_id", enrollment.ID)
+			return domains.SurveyDetails{}, err
+		}
+
+		invitations = append(invitations, domains.EnrollmentInvitation{
+			EnrollmentID: enrollment.ID,
+			Token:        token,
+			ExpiresAt:    expiresAt,
+			FullName:     enrollment.FullName,
+			Email:        enrollment.Email,
+		})
+	}
+
+	return domains.SurveyDetails{
+		Survey:      survey,
+		Invitations: invitations,
+	}, nil
+}
+
+func (h *SurveyService) SubmitSurveyResponse(ctx context.Context, submission domains.SurveySubmission) (domains.SurveyResult, error) {
+	if submission.Token == "" {
+		return domains.SurveyResult{}, ErrSurveyTokenInvalid
+	}
+
+	access, err := h.fetchSurveyAccess(ctx, submission.Token)
+	if err != nil {
+		return domains.SurveyResult{}, err
+	}
+	if err := ensureTokenUsable(access); err != nil {
+		return domains.SurveyResult{}, err
+	}
+
+	channel := submission.Channel
+	if channel == "" {
+		channel = "api"
+	}
+
+	answers := make([]domains.SurveyAnswerToSave, 0, len(submission.Answers))
+	for _, answer := range submission.Answers {
+		if answer.QuestionCode == "" {
+			continue
+		}
+		repeatPath := answer.RepeatPath
+		answers = append(answers, domains.SurveyAnswerToSave{
+			QuestionCode:  answer.QuestionCode,
+			SectionCode:   answer.SectionCode,
+			RepeatPath:    repeatPath,
+			ValueText:     answer.ValueText,
+			ValueNumber:   answer.ValueNumber,
+			ValueBool:     answer.ValueBool,
+			ValueDate:     answer.ValueDate,
+			ValueDateTime: answer.ValueDateTime,
+			ValueJSON:     answer.ValueJSON,
+		})
+	}
+
+	payload := domains.SurveyResponseToSave{
+		SurveyID:       access.Survey.ID,
+		EnrollmentID:   access.Enrollment.ID,
+		Channel:        channel,
+		State:          "submitted",
+		SubmittedAt:    time.Now().UTC(),
+		Answers:        answers,
+		IncrementUsage: true,
+	}
+
+	saved, err := h.provider.SubmitSurveyResponse(ctx, payload)
+	if err != nil {
+		slog.Error("SubmitSurveyResponse failed", "err", err, "enrollment_id", access.Enrollment.ID)
+		return domains.SurveyResult{}, err
+	}
+
+	access.Enrollment.UsedCount++
+	if access.Enrollment.State == "invited" || access.Enrollment.State == "pending" {
+		access.Enrollment.State = "approved"
+	}
+
+	return domains.SurveyResult{
+		Survey:     access.Survey,
+		Enrollment: access.Enrollment,
+		Response:   saved.Response,
+		Answers:    saved.Answers,
+	}, nil
+}
+
+func (h *SurveyService) GetSurveyResultByToken(ctx context.Context, token string) (domains.SurveyResult, error) {
+	access, err := h.fetchSurveyAccess(ctx, token)
+	if err != nil {
+		return domains.SurveyResult{}, err
+	}
+
+	result, err := h.provider.GetSurveyResultByEnrollmentID(ctx, access.Enrollment.ID)
+	if err != nil {
+		switch {
+		case errors.Is(err, storage.ErrNotFound):
+			return domains.SurveyResult{}, ErrSurveyResponseNotFound
+		default:
+			slog.Error("GetSurveyResultByToken failed", "err", err, "enrollment_id", access.Enrollment.ID)
+			return domains.SurveyResult{}, err
+		}
+	}
+
+	return domains.SurveyResult{
+		Survey:     access.Survey,
+		Enrollment: access.Enrollment,
+		Response:   result.Response,
+		Answers:    result.Answers,
+	}, nil
 }
 
 func (h *SurveyService) AccessSurveyByToken(ctx context.Context, token string) (domains.SurveyAccess, error) {
+	access, err := h.fetchSurveyAccess(ctx, token)
+	if err != nil {
+		return domains.SurveyAccess{}, err
+	}
+	if err := ensureTokenUsable(access); err != nil {
+		return domains.SurveyAccess{}, err
+	}
+	return access, nil
+}
+
+func (h *SurveyService) fetchSurveyAccess(ctx context.Context, token string) (domains.SurveyAccess, error) {
 	if token == "" {
 		return domains.SurveyAccess{}, ErrSurveyTokenInvalid
 	}
@@ -121,7 +275,7 @@ func (h *SurveyService) AccessSurveyByToken(ctx context.Context, token string) (
 		return []byte(h.secret), nil
 	})
 	if err != nil || !parsedToken.Valid {
-		slog.Warn("AccessSurveyByToken parse", "err", err)
+		slog.Warn("fetchSurveyAccess parse", "err", err)
 		return domains.SurveyAccess{}, ErrSurveyTokenInvalid
 	}
 
@@ -140,35 +294,48 @@ func (h *SurveyService) AccessSurveyByToken(ctx context.Context, token string) (
 	}
 
 	hash := sha256.Sum256([]byte(token))
-	access, err := h.provider.GetSurveyAccessByHash(ctx, hash[:])
+	slog.Info(token, hash)
+	access, err := h.provider.GetSurveyAccessByHash(ctx, int(enrollmentID))
 	if err != nil {
-		slog.Warn("AccessSurveyByToken storage", "err", err)
+		if errors.Is(err, storage.ErrNotFound) {
+			return domains.SurveyAccess{}, ErrSurveyTokenInvalid
+		}
+		slog.Warn("fetchSurveyAccess storage", "err", err)
 		return domains.SurveyAccess{}, ErrSurveyTokenInvalid
 	}
 
 	if access.Enrollment.ID != enrollmentID {
-		slog.Warn("AccessSurveyByToken enrollment mismatch", "expected", enrollmentID, "actual", access.Enrollment.ID)
+		slog.Warn("fetchSurveyAccess enrollment mismatch", "expected", enrollmentID, "actual", access.Enrollment.ID)
 		return domains.SurveyAccess{}, ErrSurveyTokenInvalid
 	}
 	if access.Survey.ID != surveyID {
-		slog.Warn("AccessSurveyByToken survey mismatch", "expected", surveyID, "actual", access.Survey.ID)
+		slog.Warn("fetchSurveyAccess survey mismatch", "expected", surveyID, "actual", access.Survey.ID)
 		return domains.SurveyAccess{}, ErrSurveyTokenInvalid
 	}
-
 	if access.Enrollment.TokenExpiresAt != nil && time.Now().After(*access.Enrollment.TokenExpiresAt) {
 		return domains.SurveyAccess{}, ErrSurveyTokenExpired
 	}
-	if access.Enrollment.UseLimit > 0 && access.Enrollment.UsedCount >= access.Enrollment.UseLimit {
-		return domains.SurveyAccess{}, ErrSurveyTokenUsed
-	}
-	switch access.Enrollment.State {
-	case "invited", "pending", "approved", "active":
-		// allowed states
-	default:
+	if !isEnrollmentTokenAllowed(access.Enrollment.State) {
 		return domains.SurveyAccess{}, ErrSurveyTokenInvalid
 	}
 
 	return access, nil
+}
+
+func ensureTokenUsable(access domains.SurveyAccess) error {
+	if access.Enrollment.UseLimit > 0 && access.Enrollment.UsedCount >= access.Enrollment.UseLimit {
+		return ErrSurveyTokenUsed
+	}
+	return nil
+}
+
+func isEnrollmentTokenAllowed(state string) bool {
+	switch state {
+	case "invited", "pending", "approved", "active":
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *SurveyService) buildToken(payload domains.EnrollmentTokenPayload) (string, []byte, time.Time, error) {

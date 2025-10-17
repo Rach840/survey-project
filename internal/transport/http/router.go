@@ -40,6 +40,8 @@ func Router(db *pgxpool.Pool, cfg *config.Config) *mux.Router {
 
 	surveyPublic := api.PathPrefix("/survey").Subrouter()
 	surveyPublic.HandleFunc("/access", surveyHandler.AccessSurveyByToken).Methods(http.MethodPost, http.MethodGet)
+	surveyPublic.HandleFunc("/response", surveyHandler.SubmitSurveyResponse).Methods(http.MethodPost)
+	surveyPublic.HandleFunc("/response", surveyHandler.GetSurveyResult).Methods(http.MethodGet)
 
 	survey := api.PathPrefix("/survey").Subrouter()
 	survey.Use(httpx.Protected(cfg.JWT.Secret))

@@ -20,8 +20,10 @@ type SurveyHandlers struct {
 type SurveyServices interface {
 	CreateSurvey(ctx context.Context, survey domains.SurveyCreate, userId int) (domains.SurveyCreateResult, error)
 	GetAllSurveysByUser(ctx context.Context, userId int) ([]domains.Survey, error)
-	GetSurveyById(ctx context.Context, userId int, surveyId int) (domains.Survey, error)
+	GetSurveyById(ctx context.Context, userId int, surveyId int) (domains.SurveyDetails, error)
 	AccessSurveyByToken(ctx context.Context, token string) (domains.SurveyAccess, error)
+	SubmitSurveyResponse(ctx context.Context, submission domains.SurveySubmission) (domains.SurveyResult, error)
+	GetSurveyResultByToken(ctx context.Context, token string) (domains.SurveyResult, error)
 }
 
 func NewSurveyHandlers(service SurveyServices) *SurveyHandlers {
@@ -87,14 +89,14 @@ func (h *SurveyHandlers) GetSurveyById(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	survey, err := h.service.GetSurveyById(r.Context(), user, int(surveyID))
+	details, err := h.service.GetSurveyById(r.Context(), user, int(surveyID))
 	if err != nil {
 		slog.Error("GetSurveyById failed", "err", err, "user", user, "survey", surveyID)
 		httpx.Error(w, http.StatusInternalServerError, "Не удалось получить анкету")
 		return
 	}
 
-	httpx.JSON(w, http.StatusOK, survey)
+	httpx.JSON(w, http.StatusOK, details)
 }
 
 func (h *SurveyHandlers) AccessSurveyByToken(w http.ResponseWriter, r *http.Request) {
@@ -111,7 +113,7 @@ func (h *SurveyHandlers) AccessSurveyByToken(w http.ResponseWriter, r *http.Requ
 		httpx.Error(w, http.StatusBadRequest, "token is required")
 		return
 	}
-
+	slog.Info("AccessSurveyByToken", "token", token)
 	access, err := h.service.AccessSurveyByToken(r.Context(), token)
 	if err != nil {
 		switch {
@@ -129,4 +131,68 @@ func (h *SurveyHandlers) AccessSurveyByToken(w http.ResponseWriter, r *http.Requ
 	}
 
 	httpx.JSON(w, http.StatusOK, access)
+}
+
+func (h *SurveyHandlers) SubmitSurveyResponse(w http.ResponseWriter, r *http.Request) {
+	submission, err := httpx.ReadBody[domains.SurveySubmission](*r)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if submission.Token == "" {
+		httpx.Error(w, http.StatusBadRequest, "token is required")
+		return
+	}
+
+	result, err := h.service.SubmitSurveyResponse(r.Context(), submission)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrSurveyTokenInvalid):
+			httpx.Error(w, http.StatusUnauthorized, "Недействительный токен")
+		case errors.Is(err, service.ErrSurveyTokenExpired):
+			httpx.Error(w, http.StatusGone, "Срок действия токена истек")
+		case errors.Is(err, service.ErrSurveyTokenUsed):
+			httpx.Error(w, http.StatusForbidden, "Лимит использования токена исчерпан")
+		default:
+			slog.Error("SubmitSurveyResponse failed", "err", err)
+			httpx.Error(w, http.StatusInternalServerError, "Не удалось сохранить ответы")
+		}
+		return
+	}
+
+	httpx.JSON(w, http.StatusOK, result)
+}
+
+func (h *SurveyHandlers) GetSurveyResult(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	if token == "" && r.Method != http.MethodGet {
+		request, err := httpx.ReadBody[domains.SurveyAccessRequest](*r)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		token = request.Token
+	}
+	if token == "" {
+		httpx.Error(w, http.StatusBadRequest, "token is required")
+		return
+	}
+
+	result, err := h.service.GetSurveyResultByToken(r.Context(), token)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrSurveyTokenInvalid):
+			httpx.Error(w, http.StatusUnauthorized, "Недействительный токен")
+		case errors.Is(err, service.ErrSurveyTokenExpired):
+			httpx.Error(w, http.StatusGone, "Срок действия токена истек")
+		case errors.Is(err, service.ErrSurveyResponseNotFound):
+			httpx.Error(w, http.StatusNotFound, "Результат не найден")
+		default:
+			slog.Error("GetSurveyResult failed", "err", err)
+			httpx.Error(w, http.StatusInternalServerError, "Не удалось получить результат анкеты")
+		}
+		return
+	}
+
+	httpx.JSON(w, http.StatusOK, result)
 }
