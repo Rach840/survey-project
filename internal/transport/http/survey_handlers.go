@@ -8,9 +8,6 @@ import (
 	"mymodule/internal/httpx"
 	"mymodule/internal/service"
 	"net/http"
-	"strconv"
-
-	"github.com/gorilla/mux"
 )
 
 type SurveyHandlers struct {
@@ -19,8 +16,9 @@ type SurveyHandlers struct {
 
 type SurveyServices interface {
 	CreateSurvey(ctx context.Context, survey domains.SurveyCreate, userId int) (domains.SurveyCreateResult, error)
-	GetAllSurveysByUser(ctx context.Context, userId int) ([]domains.Survey, error)
+	GetAllSurveysByUser(ctx context.Context, userId int) ([]domains.SurveySummary, error)
 	GetSurveyById(ctx context.Context, userId int, surveyId int) (domains.SurveyDetails, error)
+	GetSurveyResults(ctx context.Context, userId int, surveyId int) (domains.SurveyResultsSummary, error)
 	AccessSurveyByToken(ctx context.Context, token string) (domains.SurveyAccess, error)
 	SubmitSurveyResponse(ctx context.Context, submission domains.SurveySubmission) (domains.SurveyResult, error)
 	GetSurveyResultByToken(ctx context.Context, token string) (domains.SurveyResult, error)
@@ -71,17 +69,12 @@ func (h *SurveyHandlers) GetAllSurveysByUser(w http.ResponseWriter, r *http.Requ
 		httpx.Error(w, http.StatusInternalServerError, "Не удалось получить анкеты")
 		return
 	}
-
+	slog.Info("surveys", surveys)
 	httpx.JSON(w, http.StatusOK, surveys)
 }
 
 func (h *SurveyHandlers) GetSurveyById(w http.ResponseWriter, r *http.Request) {
-	idStr := mux.Vars(r)["id"]
-	surveyID, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "Некорректный идентификатор анкеты")
-		return
-	}
+	surveyID := httpx.GetId(w, r)
 
 	user, ok := httpx.UserIdFromContext(r.Context())
 	if !ok {
@@ -97,6 +90,26 @@ func (h *SurveyHandlers) GetSurveyById(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httpx.JSON(w, http.StatusOK, details)
+}
+
+func (h *SurveyHandlers) GetSurveyResults(w http.ResponseWriter, r *http.Request) {
+	slog.Info("surveyResults", r.URL.Query())
+	surveyID := httpx.GetId(w, r)
+
+	user, ok := httpx.UserIdFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	results, err := h.service.GetSurveyResults(r.Context(), user, int(surveyID))
+	if err != nil {
+		slog.Error("GetSurveyResults failed", "err", err, "user", user, "survey", surveyID)
+		httpx.Error(w, http.StatusInternalServerError, "Не удалось получить результаты анкеты")
+		return
+	}
+
+	httpx.JSON(w, http.StatusOK, results)
 }
 
 func (h *SurveyHandlers) AccessSurveyByToken(w http.ResponseWriter, r *http.Request) {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"mymodule/internal/domains"
 	"mymodule/internal/storage"
 
@@ -98,7 +97,6 @@ func (s *TemplateProvider) UpdateTemplate(ctx context.Context, templateID int, t
 		return fmt.Errorf("Ошибка начала транзакции")
 	}
 	defer tx.Rollback(ctx)
-	slog.Info("template", template.Title, template.Description, template.Version+1, "draft", template.Section, template.Section, template.ID, userId, "userId", userId)
 	var templateId int
 	err = tx.QueryRow(ctx, `SELECT id
          FROM form_templates

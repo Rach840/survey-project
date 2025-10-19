@@ -25,13 +25,15 @@ type SurveyService struct {
 
 type SurveyProvider interface {
 	SaveSurvey(ctx context.Context, survey domains.SurveyToSave, generator domains.EnrollmentTokenGenerator) (domains.Survey, []domains.EnrollmentInvitation, error)
-	GetAllSurveysByUser(ctx context.Context, userId int64) ([]domains.Survey, error)
+	GetAllSurveysByUser(ctx context.Context, userId int64) ([]domains.SurveySummary, error)
 	GetSurveyByID(ctx context.Context, ownerID int64, surveyID int64) (domains.Survey, error)
 	GetSurveyAccessByHash(ctx context.Context, id int) (domains.SurveyAccess, error)
 	ListEnrollmentsBySurveyID(ctx context.Context, ownerID int64, surveyID int64) ([]domains.Enrollment, error)
 	UpdateEnrollmentToken(ctx context.Context, enrollmentID int64, hash []byte, expiresAt time.Time) error
 	SubmitSurveyResponse(ctx context.Context, payload domains.SurveyResponseToSave) (domains.SurveyResponseResult, error)
 	GetSurveyResultByEnrollmentID(ctx context.Context, enrollmentID int64) (domains.SurveyResponseResult, error)
+	ListSurveyResults(ctx context.Context, ownerID int64, surveyID int64) ([]domains.SurveyResult, error)
+	GetSurveyStatistics(ctx context.Context, ownerID int64, surveyID int64) (domains.SurveyStatisticsCounts, error)
 }
 
 func NewSurveyService(provider SurveyProvider, templates TemplateProvider, secret string) *SurveyService {
@@ -95,7 +97,7 @@ func (h *SurveyService) CreateSurvey(ctx context.Context, payload domains.Survey
 	return domains.SurveyCreateResult{Survey: survey, Invitations: invites}, nil
 }
 
-func (h *SurveyService) GetAllSurveysByUser(ctx context.Context, userId int) ([]domains.Survey, error) {
+func (h *SurveyService) GetAllSurveysByUser(ctx context.Context, userId int) ([]domains.SurveySummary, error) {
 	surveys, err := h.provider.GetAllSurveysByUser(ctx, int64(userId))
 	if err != nil {
 		slog.Error("GetAllSurveysByUser failed", "err", err, "user_id", userId)
@@ -112,11 +114,16 @@ func (h *SurveyService) GetSurveyById(ctx context.Context, userId int, surveyId 
 	}
 
 	enrollments, err := h.provider.ListEnrollmentsBySurveyID(ctx, int64(userId), int64(surveyId))
+
 	if err != nil {
 		slog.Error("ListEnrollmentsBySurveyID failed", "err", err, "user_id", userId, "survey_id", surveyId)
 		return domains.SurveyDetails{}, err
 	}
-
+	statsCounts, err := h.provider.GetSurveyStatistics(ctx, int64(userId), int64(surveyId))
+	if err != nil {
+		slog.Error("GetSurveyStatistics failed", "err", err, "user_id", userId, "survey_id", surveyId)
+		return domains.SurveyDetails{}, err
+	}
 	invitations := make([]domains.EnrollmentInvitation, 0, len(enrollments))
 	for _, enrollment := range enrollments {
 		if !isEnrollmentTokenAllowed(enrollment.State) {
@@ -157,6 +164,37 @@ func (h *SurveyService) GetSurveyById(ctx context.Context, userId int, surveyId 
 	return domains.SurveyDetails{
 		Survey:      survey,
 		Invitations: invitations,
+		Statistics:  statsCounts.ToSurveyStatistics(),
+	}, nil
+}
+
+func (h *SurveyService) GetSurveyResults(ctx context.Context, userId int, surveyId int) (domains.SurveyResultsSummary, error) {
+	survey, err := h.provider.GetSurveyByID(ctx, int64(userId), int64(surveyId))
+	if err != nil {
+		slog.Error("GetSurveyResults get survey failed", "err", err, "user_id", userId, "survey_id", surveyId)
+		return domains.SurveyResultsSummary{}, err
+	}
+
+	results, err := h.provider.ListSurveyResults(ctx, int64(userId), int64(surveyId))
+	if err != nil {
+		slog.Error("ListSurveyResults failed", "err", err, "user_id", userId, "survey_id", surveyId)
+		return domains.SurveyResultsSummary{}, err
+	}
+
+	statsCounts, err := h.provider.GetSurveyStatistics(ctx, int64(userId), int64(surveyId))
+	if err != nil {
+		slog.Error("GetSurveyStatistics failed", "err", err, "user_id", userId, "survey_id", surveyId)
+		return domains.SurveyResultsSummary{}, err
+	}
+	// TODO посмотреть как он себя ведет с результатами
+	for i := range results {
+		results[i].Survey = survey
+	}
+
+	return domains.SurveyResultsSummary{
+		Survey:     survey,
+		Results:    results,
+		Statistics: statsCounts.ToSurveyStatistics(),
 	}, nil
 }
 

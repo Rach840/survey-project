@@ -8,9 +8,6 @@ import (
 	"mymodule/internal/httpx"
 	"mymodule/internal/storage"
 	"net/http"
-	"strconv"
-
-	"github.com/gorilla/mux"
 )
 
 type TemplateHandlers struct {
@@ -76,8 +73,7 @@ func (h *TemplateHandlers) GetAllTemplatesByUser(w http.ResponseWriter, r *http.
 	return
 }
 func (h *TemplateHandlers) GetTemplateById(w http.ResponseWriter, r *http.Request) {
-	idStr := mux.Vars(r)["id"]
-	templateIDInt, err := strconv.ParseInt(idStr, 10, 64)
+	templateIDInt := httpx.GetId(w, r)
 	user, ok := httpx.UserIdFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "Unauthorized")
@@ -94,8 +90,8 @@ func (h *TemplateHandlers) GetTemplateById(w http.ResponseWriter, r *http.Reques
 	return
 }
 func (h *TemplateHandlers) UpdateTemplate(w http.ResponseWriter, r *http.Request) {
-	idStr := mux.Vars(r)["id"]
-	templateIDInt, err := strconv.ParseInt(idStr, 10, 64)
+
+	templateIDInt := httpx.GetId(w, r)
 	user, ok := httpx.UserIdFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "Unauthorized")

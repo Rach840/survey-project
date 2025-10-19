@@ -68,11 +68,6 @@ type SurveyCreateResult struct {
 	Invitations []EnrollmentInvitation `json:"invitations"`
 }
 
-type SurveyDetails struct {
-	Survey      Survey                 `json:"survey"`
-	Invitations []EnrollmentInvitation `json:"invitations"`
-}
-
 type EnrollmentTokenPayload struct {
 	SurveyID     int64
 	EnrollmentID int64

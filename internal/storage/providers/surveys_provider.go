@@ -44,14 +44,7 @@ func (s SurveyProvider) SaveSurvey(ctx context.Context, survey domains.SurveyToS
               form_snapshot_json, title, mode, status,
               max_participants, public_slug, starts_at, ends_at, created_at`
 
-	var created domains.Survey
-	var templateID sql.NullInt64
-	var maxParticipants sql.NullInt64
-	var publicSlug sql.NullString
-	var startsAt *time.Time
-	var endsAt *time.Time
-
-	row := tx.QueryRow(ctx, insertSurvey,
+	row, err := tx.Query(ctx, insertSurvey,
 		survey.OwnerID,
 		survey.TemplateID,
 		survey.SnapshotVersion,
@@ -64,38 +57,14 @@ func (s SurveyProvider) SaveSurvey(ctx context.Context, survey domains.SurveyToS
 		survey.StartsAt,
 		survey.EndsAt,
 	)
-
-	if err := row.Scan(
-		&created.ID,
-		&created.OwnerID,
-		&templateID,
-		&created.SnapshotVersion,
-		&created.FormSnapshotJSON,
-		&created.Title,
-		&created.Mode,
-		&created.Status,
-		&maxParticipants,
-		&publicSlug,
-		&startsAt,
-		&endsAt,
-		&created.CreatedAt,
-	); err != nil {
+	if err != nil {
+		return domains.Survey{}, nil, err
+	}
+	defer row.Close()
+	created, err := pgx.CollectOneRow(row, pgx.RowToStructByName[domains.Survey])
+	if err != nil {
 		return domains.Survey{}, nil, fmt.Errorf("insert survey: %w", err)
 	}
-
-	if templateID.Valid {
-		created.TemplateID = &templateID.Int64
-	}
-	if maxParticipants.Valid {
-		v := int(maxParticipants.Int64)
-		created.MaxParticipants = &v
-	}
-	if publicSlug.Valid {
-		slug := publicSlug.String
-		created.PublicSlug = &slug
-	}
-	created.StartsAt = startsAt
-	created.EndsAt = endsAt
 
 	invitations := make([]domains.EnrollmentInvitation, 0, len(survey.Enrollments))
 	insertEnrollment := `
@@ -153,15 +122,41 @@ func (s SurveyProvider) SaveSurvey(ctx context.Context, survey domains.SurveyToS
 	return created, invitations, nil
 }
 
-func (s SurveyProvider) GetAllSurveysByUser(ctx context.Context, userId int64) ([]domains.Survey, error) {
+func (s SurveyProvider) GetAllSurveysByUser(ctx context.Context, userId int64) ([]domains.SurveySummary, error) {
 	const query = `
 		SELECT
-			id, owner_id, template_id, snapshot_version,
-			form_snapshot_json, title, mode, status,
-			max_participants, public_slug, starts_at, ends_at, created_at
-		FROM surveys
-		WHERE owner_id = $1
-		ORDER BY created_at DESC`
+			s.id,
+			s.owner_id,
+			s.template_id,
+			s.snapshot_version,
+			s.form_snapshot_json,
+			s.title,
+			s.mode,
+			s.status,
+			s.max_participants,
+			s.public_slug,
+			s.starts_at,
+			s.ends_at,
+			s.created_at,
+			COALESCE(stats.total_enrollments, 0) AS total_enrollments,
+			COALESCE(stats.responses_started, 0) AS responses_started,
+			COALESCE(stats.responses_submitted, 0) AS responses_submitted,
+			COALESCE(stats.responses_in_progress, 0) AS responses_in_progress,
+			stats.avg_completion_seconds
+		FROM surveys s
+		LEFT JOIN LATERAL (
+			SELECT
+				COUNT(e.id) AS total_enrollments,
+				COUNT(r.id) AS responses_started,
+				COUNT(*) FILTER (WHERE r.state = 'submitted') AS responses_submitted,
+				COUNT(*) FILTER (WHERE r.state = 'in_progress') AS responses_in_progress,
+				AVG(EXTRACT(EPOCH FROM (r.submitted_at - r.started_at))) AS avg_completion_seconds
+			FROM enrollments e
+			LEFT JOIN responses r ON r.enrollment_id = e.id
+			WHERE e.survey_id = s.id
+		) AS stats ON true
+		WHERE s.owner_id = $1
+		ORDER BY s.created_at DESC`
 
 	rows, err := s.db.Query(ctx, query, userId)
 	if err != nil {
@@ -169,17 +164,96 @@ func (s SurveyProvider) GetAllSurveysByUser(ctx context.Context, userId int64) (
 	}
 	defer rows.Close()
 
-	var result []domains.Survey
+	var result []domains.SurveySummary
+
 	for rows.Next() {
-		survey, err := scanSurvey(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan survey: %w", err)
+		var (
+			survey          domains.Survey
+			total           int
+			started         int
+			submitted       int
+			inProgress      int
+			templateID      sql.NullInt64
+			formSnapshot    []byte
+			maxParticipants sql.NullInt64
+			publicSlug      sql.NullString
+			startsAt        *time.Time
+			endsAt          *time.Time
+			avgSeconds      sql.NullFloat64
+		)
+
+		if err := rows.Scan(
+			&survey.ID,
+			&survey.OwnerID,
+			&templateID,
+			&survey.SnapshotVersion,
+			&formSnapshot,
+			&survey.Title,
+			&survey.Mode,
+			&survey.Status,
+			&maxParticipants,
+			&publicSlug,
+			&startsAt,
+			&endsAt,
+			&survey.CreatedAt,
+			&total,
+			&started,
+			&submitted,
+			&inProgress,
+			&avgSeconds,
+		); err != nil {
+			return nil, fmt.Errorf("scan survey summary: %w", err)
 		}
-		result = append(result, survey)
+
+		if templateID.Valid {
+			value := templateID.Int64
+			survey.TemplateID = &value
+		} else {
+			survey.TemplateID = nil
+		}
+		if len(formSnapshot) > 0 {
+			data := make(json.RawMessage, len(formSnapshot))
+			copy(data, formSnapshot)
+			survey.FormSnapshotJSON = data
+		} else {
+			survey.FormSnapshotJSON = nil
+		}
+		if maxParticipants.Valid {
+			value := int(maxParticipants.Int64)
+			survey.MaxParticipants = &value
+		} else {
+			survey.MaxParticipants = nil
+		}
+		if publicSlug.Valid {
+			slug := publicSlug.String
+			survey.PublicSlug = &slug
+		} else {
+			survey.PublicSlug = nil
+		}
+		survey.StartsAt = startsAt
+		survey.EndsAt = endsAt
+
+		counts := domains.SurveyStatisticsCounts{
+			TotalEnrollments:    total,
+			ResponsesStarted:    started,
+			ResponsesSubmitted:  submitted,
+			ResponsesInProgress: inProgress,
+		}
+		if avgSeconds.Valid {
+			value := avgSeconds.Float64
+			counts.AverageCompletionSeconds = &value
+		}
+
+		result = append(result, domains.SurveySummary{
+			Survey:     survey,
+			Statistics: counts.ToSurveyStatistics(),
+		})
 	}
+
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate surveys: %w", err)
 	}
+
 	return result, nil
 }
 
@@ -192,8 +266,8 @@ func (s SurveyProvider) GetSurveyByID(ctx context.Context, ownerID int64, survey
 		FROM surveys
 		WHERE owner_id = $1 AND id = $2`
 
-	row := s.db.QueryRow(ctx, query, ownerID, surveyID)
-	survey, err := scanSurvey(row)
+	row, err := s.db.Query(ctx, query, ownerID, surveyID)
+	survey, err := pgx.CollectOneRow(row, pgx.RowToStructByName[domains.Survey])
 	if err != nil {
 		return domains.Survey{}, fmt.Errorf("get survey: %w", err)
 	}
@@ -225,14 +299,7 @@ func (s SurveyProvider) ListEnrollmentsBySurveyID(ctx context.Context, ownerID i
 	}
 	defer rows.Close()
 
-	var enrollments []domains.Enrollment
-	for rows.Next() {
-		enrollment, err := scanEnrollment(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan enrollment: %w", err)
-		}
-		enrollments = append(enrollments, enrollment)
-	}
+	enrollments, err := pgx.CollectRows(rows, pgx.RowToStructByName[domains.Enrollment])
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate enrollments: %w", err)
 	}
@@ -272,7 +339,7 @@ func (s SurveyProvider) SubmitSurveyResponse(ctx context.Context, payload domain
 		    submitted_at = EXCLUDED.submitted_at
 		RETURNING id, survey_id, enrollment_id, state, channel, started_at, submitted_at`
 
-	row := tx.QueryRow(ctx, upsert,
+	row, _ := tx.Query(ctx, upsert,
 		payload.SurveyID,
 		payload.EnrollmentID,
 		payload.State,
@@ -280,7 +347,8 @@ func (s SurveyProvider) SubmitSurveyResponse(ctx context.Context, payload domain
 		payload.SubmittedAt,
 	)
 
-	response, err := scanResponse(row)
+	response, err := pgx.CollectOneRow(row, pgx.RowToStructByName[domains.SurveyResponse])
+
 	if err != nil {
 		return domains.SurveyResponseResult{}, fmt.Errorf("upsert response: %w", err)
 	}
@@ -348,8 +416,8 @@ func (s SurveyProvider) GetSurveyResultByEnrollmentID(ctx context.Context, enrol
 		WHERE enrollment_id = $1
 		LIMIT 1`
 
-	row := s.db.QueryRow(ctx, query, enrollmentID)
-	response, err := scanResponse(row)
+	row, err := s.db.Query(ctx, query, enrollmentID)
+	response, err := pgx.CollectOneRow(row, pgx.RowToStructByName[domains.SurveyResponse])
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domains.SurveyResponseResult{}, fmt.Errorf("get survey response: %w", storage.ErrNotFound)
@@ -391,6 +459,225 @@ func (s SurveyProvider) GetSurveyResultByEnrollmentID(ctx context.Context, enrol
 	}
 
 	return domains.SurveyResponseResult{Response: response, Answers: answers}, nil
+}
+
+func (s SurveyProvider) ListSurveyResults(ctx context.Context, ownerID int64, surveyID int64) ([]domains.SurveyResult, error) {
+	const responsesQuery = `
+		SELECT
+			r.id,
+			r.survey_id,
+			r.enrollment_id,
+			r.state,
+			r.channel,
+			r.started_at,
+			r.submitted_at,
+			e.id,
+			e.survey_id,
+			e.full_name,
+			e.email,
+			e.phone,
+			e.telegram_chat_id,
+			e.state,
+			e.token_expires_at,
+			e.use_limit,
+			e.used_count
+		FROM responses r
+		JOIN enrollments e ON e.id = r.enrollment_id
+		JOIN surveys s ON s.id = r.survey_id
+		WHERE s.owner_id = $1 AND s.id = $2
+		ORDER BY r.started_at`
+
+	rows, err := s.db.Query(ctx, responsesQuery, ownerID, surveyID)
+	if err != nil {
+		return nil, fmt.Errorf("list survey responses: %w", err)
+	}
+	defer rows.Close()
+
+	type responseItem struct {
+		Response   domains.SurveyResponse
+		Enrollment domains.Enrollment
+	}
+
+	items := make([]responseItem, 0)
+	responseIDs := make([]int64, 0)
+
+	for rows.Next() {
+		var (
+			item         responseItem
+			channel      sql.NullString
+			submittedAt  sql.NullTime
+			email        sql.NullString
+			phone        sql.NullString
+			telegram     sql.NullInt64
+			tokenExpires sql.NullTime
+		)
+
+		if err := rows.Scan(
+			&item.Response.ID,
+			&item.Response.SurveyID,
+			&item.Response.EnrollmentID,
+			&item.Response.State,
+			&channel,
+			&item.Response.StartedAt,
+			&submittedAt,
+			&item.Enrollment.ID,
+			&item.Enrollment.SurveyID,
+			&item.Enrollment.FullName,
+			&email,
+			&phone,
+			&telegram,
+			&item.Enrollment.State,
+			&tokenExpires,
+			&item.Enrollment.UseLimit,
+			&item.Enrollment.UsedCount,
+		); err != nil {
+			return nil, fmt.Errorf("scan survey response: %w", err)
+		}
+
+		if channel.Valid {
+			value := channel.String
+			item.Response.Channel = &value
+		}
+		if submittedAt.Valid {
+			t := submittedAt.Time
+			item.Response.SubmittedAt = &t
+		}
+		if email.Valid {
+			value := email.String
+			item.Enrollment.Email = &value
+		}
+		if phone.Valid {
+			value := phone.String
+			item.Enrollment.Phone = &value
+		}
+		if telegram.Valid {
+			id := telegram.Int64
+			item.Enrollment.TelegramChatID = &id
+		}
+		if tokenExpires.Valid {
+			t := tokenExpires.Time
+			item.Enrollment.TokenExpiresAt = &t
+		}
+
+		items = append(items, item)
+		responseIDs = append(responseIDs, item.Response.ID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate survey responses: %w", err)
+	}
+
+	if len(items) == 0 {
+		return nil, nil
+	}
+
+	const answersQuery = `
+		SELECT
+			response_id,
+			question_code,
+			section_code,
+			repeat_path,
+			value_text,
+			value_number,
+			value_bool,
+			value_date,
+			value_datetime,
+			value_json
+		FROM answers
+		WHERE response_id = ANY($1)
+		ORDER BY response_id, question_code, repeat_path`
+
+	answerRows, err := s.db.Query(ctx, answersQuery, responseIDs)
+	if err != nil {
+		return nil, fmt.Errorf("list survey answers: %w", err)
+	}
+	defer answerRows.Close()
+
+	answersByResponse := make(map[int64][]domains.SurveyAnswer, len(responseIDs))
+
+	for answerRows.Next() {
+		var (
+			responseID    int64
+			questionCode  string
+			sectionCode   sql.NullString
+			repeatPath    string
+			valueText     sql.NullString
+			valueNumber   sql.NullFloat64
+			valueBool     sql.NullBool
+			valueDate     sql.NullTime
+			valueDateTime sql.NullTime
+			valueJSON     []byte
+		)
+
+		if err := answerRows.Scan(
+			&responseID,
+			&questionCode,
+			&sectionCode,
+			&repeatPath,
+			&valueText,
+			&valueNumber,
+			&valueBool,
+			&valueDate,
+			&valueDateTime,
+			&valueJSON,
+		); err != nil {
+			return nil, fmt.Errorf("scan survey answer: %w", err)
+		}
+
+		answer := mapSurveyAnswer(questionCode, sectionCode, repeatPath, valueText, valueNumber, valueBool, valueDate, valueDateTime, valueJSON)
+		answersByResponse[responseID] = append(answersByResponse[responseID], answer)
+	}
+	if err := answerRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate survey answers: %w", err)
+	}
+
+	results := make([]domains.SurveyResult, 0, len(items))
+	for _, item := range items {
+		results = append(results, domains.SurveyResult{
+			Enrollment: item.Enrollment,
+			Response:   item.Response,
+			Answers:    answersByResponse[item.Response.ID],
+		})
+	}
+
+	return results, nil
+}
+
+func (s SurveyProvider) GetSurveyStatistics(ctx context.Context, ownerID int64, surveyID int64) (domains.SurveyStatisticsCounts, error) {
+	const query = `
+		SELECT
+			COUNT(e.id) AS total_enrollments,
+			COUNT(r.id) AS responses_started,
+			COUNT(*) FILTER (WHERE r.state = 'submitted') AS responses_submitted,
+			COUNT(*) FILTER (WHERE r.state = 'in_progress') AS responses_in_progress,
+			AVG(EXTRACT(EPOCH FROM (r.submitted_at - r.started_at))) FILTER (WHERE r.submitted_at IS NOT NULL) AS avg_completion_seconds
+		FROM surveys s
+		LEFT JOIN enrollments e ON e.survey_id = s.id
+		LEFT JOIN responses r ON r.enrollment_id = e.id
+		WHERE s.owner_id = $1 AND s.id = $2`
+
+	row := s.db.QueryRow(ctx, query, ownerID, surveyID)
+
+	var (
+		stats domains.SurveyStatisticsCounts
+		avg   sql.NullFloat64
+	)
+
+	if err := row.Scan(
+		&stats.TotalEnrollments,
+		&stats.ResponsesStarted,
+		&stats.ResponsesSubmitted,
+		&stats.ResponsesInProgress,
+		&avg,
+	); err != nil {
+		return domains.SurveyStatisticsCounts{}, fmt.Errorf("get survey statistics: %w", err)
+	}
+
+	if avg.Valid {
+		value := avg.Float64
+		stats.AverageCompletionSeconds = &value
+	}
+
+	return stats, nil
 }
 
 func (s SurveyProvider) GetSurveyAccessByHash(ctx context.Context, id int) (domains.SurveyAccess, error) {
@@ -510,84 +797,9 @@ func (s SurveyProvider) GetSurveyAccessByHash(ctx context.Context, id int) (doma
 	return access, nil
 }
 
-func scanSurvey(row pgx.Row) (domains.Survey, error) {
-	var (
-		survey          domains.Survey
-		templateID      sql.NullInt64
-		maxParticipants sql.NullInt64
-		publicSlug      sql.NullString
-		startsAt        *time.Time
-		endsAt          *time.Time
-	)
-
-	if err := row.Scan(
-		&survey.ID,
-		&survey.OwnerID,
-		&templateID,
-		&survey.SnapshotVersion,
-		&survey.FormSnapshotJSON,
-		&survey.Title,
-		&survey.Mode,
-		&survey.Status,
-		&maxParticipants,
-		&publicSlug,
-		&startsAt,
-		&endsAt,
-		&survey.CreatedAt,
-	); err != nil {
-		return domains.Survey{}, err
-	}
-
-	if templateID.Valid {
-		survey.TemplateID = &templateID.Int64
-	}
-	if maxParticipants.Valid {
-		value := int(maxParticipants.Int64)
-		survey.MaxParticipants = &value
-	}
-	if publicSlug.Valid {
-		slug := publicSlug.String
-		survey.PublicSlug = &slug
-	}
-	survey.StartsAt = startsAt
-	survey.EndsAt = endsAt
-
-	return survey, nil
-}
-
-func scanResponse(row pgx.Row) (domains.SurveyResponse, error) {
-	var (
-		response    domains.SurveyResponse
-		channel     sql.NullString
-		submittedAt sql.NullTime
-	)
-
-	if err := row.Scan(
-		&response.ID,
-		&response.SurveyID,
-		&response.EnrollmentID,
-		&response.State,
-		&channel,
-		&response.StartedAt,
-		&submittedAt,
-	); err != nil {
-		return domains.SurveyResponse{}, err
-	}
-
-	if channel.Valid {
-		response.Channel = &channel.String
-	}
-	if submittedAt.Valid {
-		t := submittedAt.Time
-		response.SubmittedAt = &t
-	}
-
-	return response, nil
-}
-
 func scanAnswer(row pgx.Row) (domains.SurveyAnswer, error) {
 	var (
-		answer        domains.SurveyAnswer
+		questionCode  string
 		sectionCode   sql.NullString
 		repeatPath    string
 		valueText     sql.NullString
@@ -599,7 +811,7 @@ func scanAnswer(row pgx.Row) (domains.SurveyAnswer, error) {
 	)
 
 	if err := row.Scan(
-		&answer.QuestionCode,
+		&questionCode,
 		&sectionCode,
 		&repeatPath,
 		&valueText,
@@ -612,36 +824,7 @@ func scanAnswer(row pgx.Row) (domains.SurveyAnswer, error) {
 		return domains.SurveyAnswer{}, err
 	}
 
-	if sectionCode.Valid {
-		answer.SectionCode = &sectionCode.String
-	}
-	answer.RepeatPath = repeatPath
-	if valueText.Valid {
-		answer.ValueText = &valueText.String
-	}
-	if valueNumber.Valid {
-		val := valueNumber.Float64
-		answer.ValueNumber = &val
-	}
-	if valueBool.Valid {
-		val := valueBool.Bool
-		answer.ValueBool = &val
-	}
-	if valueDate.Valid {
-		value := valueDate.Time
-		answer.ValueDate = &value
-	}
-	if valueDateTime.Valid {
-		value := valueDateTime.Time
-		answer.ValueDateTime = &value
-	}
-	if len(valueJSON) > 0 {
-		data := make(json.RawMessage, len(valueJSON))
-		copy(data, valueJSON)
-		answer.ValueJSON = data
-	}
-
-	return answer, nil
+	return mapSurveyAnswer(questionCode, sectionCode, repeatPath, valueText, valueNumber, valueBool, valueDate, valueDateTime, valueJSON), nil
 }
 
 func toSurveyAnswer(src domains.SurveyAnswerToSave) domains.SurveyAnswer {
@@ -663,49 +846,48 @@ func toSurveyAnswer(src domains.SurveyAnswerToSave) domains.SurveyAnswer {
 	return result
 }
 
-func scanEnrollment(row pgx.Row) (domains.Enrollment, error) {
-	var (
-		enrollment domains.Enrollment
-		email      sql.NullString
-		phone      sql.NullString
-		telegram   sql.NullInt64
-		expires    sql.NullTime
-		useLimit   int32
-		usedCount  int32
-	)
-
-	if err := row.Scan(
-		&enrollment.ID,
-		&enrollment.SurveyID,
-		&enrollment.FullName,
-		&email,
-		&phone,
-		&telegram,
-		&enrollment.State,
-		&enrollment.TokenHash,
-		&expires,
-		&useLimit,
-		&usedCount,
-	); err != nil {
-		return domains.Enrollment{}, err
+func mapSurveyAnswer(
+	questionCode string,
+	sectionCode sql.NullString,
+	repeatPath string,
+	valueText sql.NullString,
+	valueNumber sql.NullFloat64,
+	valueBool sql.NullBool,
+	valueDate sql.NullTime,
+	valueDateTime sql.NullTime,
+	valueJSON []byte,
+) domains.SurveyAnswer {
+	answer := domains.SurveyAnswer{
+		QuestionCode: questionCode,
+		RepeatPath:   repeatPath,
+	}
+	if sectionCode.Valid {
+		answer.SectionCode = &sectionCode.String
+	}
+	if valueText.Valid {
+		answer.ValueText = &valueText.String
+	}
+	if valueNumber.Valid {
+		value := valueNumber.Float64
+		answer.ValueNumber = &value
+	}
+	if valueBool.Valid {
+		value := valueBool.Bool
+		answer.ValueBool = &value
+	}
+	if valueDate.Valid {
+		value := valueDate.Time
+		answer.ValueDate = &value
+	}
+	if valueDateTime.Valid {
+		value := valueDateTime.Time
+		answer.ValueDateTime = &value
+	}
+	if len(valueJSON) > 0 {
+		data := make(json.RawMessage, len(valueJSON))
+		copy(data, valueJSON)
+		answer.ValueJSON = data
 	}
 
-	if email.Valid {
-		enrollment.Email = &email.String
-	}
-	if phone.Valid {
-		enrollment.Phone = &phone.String
-	}
-	if telegram.Valid {
-		value := telegram.Int64
-		enrollment.TelegramChatID = &value
-	}
-	if expires.Valid {
-		value := expires.Time
-		enrollment.TokenExpiresAt = &value
-	}
-	enrollment.UseLimit = int(useLimit)
-	enrollment.UsedCount = int(usedCount)
-
-	return enrollment, nil
+	return answer
 }

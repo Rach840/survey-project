@@ -37,6 +37,7 @@ func Protected(jwtSecret string) mux.MiddlewareFunc {
 				return []byte(jwtSecret), nil
 			})
 			if err != nil || !token.Valid {
+				Error(w, http.StatusUnauthorized, "Unauthorized")
 				log.Println(err)
 				return
 			}

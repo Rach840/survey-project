@@ -48,7 +48,9 @@ func Router(db *pgxpool.Pool, cfg *config.Config) *mux.Router {
 	survey.Use(httpx.Questioner(*allProviders.AuthProvider))
 	survey.HandleFunc("/create", surveyHandler.CreateSurvey).Methods(http.MethodPost)
 	survey.HandleFunc("/", surveyHandler.GetAllSurveysByUser).Methods(http.MethodGet)
+	survey.HandleFunc("/{id}/results", surveyHandler.GetSurveyResults).Methods(http.MethodGet)
 	survey.HandleFunc("/{id}", surveyHandler.GetSurveyById).Methods(http.MethodGet)
+	survey.HandleFunc("/{id}", surveyHandler.GetSurveyById).Methods(http.MethodPatch)
 
 	return router
 }

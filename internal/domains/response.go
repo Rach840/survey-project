@@ -78,3 +78,61 @@ type SurveyResult struct {
 	Response   SurveyResponse `json:"response"`
 	Answers    []SurveyAnswer `json:"answers"`
 }
+type SurveyDetails struct {
+	Survey      Survey                 `json:"survey"`
+	Invitations []EnrollmentInvitation `json:"invitations"`
+	Statistics  SurveyStatistics       `json:"statistics"`
+}
+
+type SurveyStatisticsCounts struct {
+	TotalEnrollments         int
+	ResponsesStarted         int
+	ResponsesSubmitted       int
+	ResponsesInProgress      int
+	AverageCompletionSeconds *float64
+}
+
+type SurveyStatistics struct {
+	TotalEnrollments          int      `json:"total_enrollments"`
+	ResponsesStarted          int      `json:"responses_started"`
+	ResponsesSubmitted        int      `json:"responses_submitted"`
+	ResponsesInProgress       int      `json:"responses_in_progress"`
+	CompletionRate            float64  `json:"completion_rate"`
+	OverallProgress           float64  `json:"overall_progress"`
+	AverageCompletionSeconds  *float64 `json:"average_completion_seconds,omitempty"`
+	AverageCompletionDuration *string  `json:"average_completion_duration,omitempty"`
+}
+
+type SurveyResultsSummary struct {
+	Survey     Survey           `json:"survey"`
+	Results    []SurveyResult   `json:"results"`
+	Statistics SurveyStatistics `json:"statistics"`
+}
+
+type SurveySummary struct {
+	Survey     Survey           `json:"survey"`
+	Statistics SurveyStatistics `json:"statistics"`
+}
+
+func (c SurveyStatisticsCounts) ToSurveyStatistics() SurveyStatistics {
+	stats := SurveyStatistics{
+		TotalEnrollments:         c.TotalEnrollments,
+		ResponsesStarted:         c.ResponsesStarted,
+		ResponsesSubmitted:       c.ResponsesSubmitted,
+		ResponsesInProgress:      c.ResponsesInProgress,
+		AverageCompletionSeconds: c.AverageCompletionSeconds,
+	}
+
+	if stats.TotalEnrollments > 0 {
+		stats.CompletionRate = float64(stats.ResponsesSubmitted) / float64(stats.TotalEnrollments)
+		stats.OverallProgress = float64(stats.ResponsesStarted) / float64(stats.TotalEnrollments)
+	}
+
+	if c.AverageCompletionSeconds != nil {
+		duration := time.Duration(*c.AverageCompletionSeconds * float64(time.Second))
+		formatted := duration.String()
+		stats.AverageCompletionDuration = &formatted
+	}
+
+	return stats
+}
