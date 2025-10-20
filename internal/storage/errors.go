@@ -7,4 +7,5 @@ var (
 	ErrUserNotFound = errors.New("User not found")
 	ErrAppNotFound  = errors.New("App not found")
 	ErrNotFound     = errors.New("not found")
+	ErrConflict     = errors.New("conflict")
 )

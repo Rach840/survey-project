@@ -26,14 +26,17 @@ type SurveyService struct {
 type SurveyProvider interface {
 	SaveSurvey(ctx context.Context, survey domains.SurveyToSave, generator domains.EnrollmentTokenGenerator) (domains.Survey, []domains.EnrollmentInvitation, error)
 	GetAllSurveysByUser(ctx context.Context, userId int64) ([]domains.SurveySummary, error)
-	GetSurveyByID(ctx context.Context, ownerID int64, surveyID int64) (domains.Survey, error)
+	GetSurveyByID(ctx context.Context, ownerID, surveyID int) (domains.Survey, error)
 	GetSurveyAccessByHash(ctx context.Context, id int) (domains.SurveyAccess, error)
 	ListEnrollmentsBySurveyID(ctx context.Context, ownerID int64, surveyID int64) ([]domains.Enrollment, error)
 	UpdateEnrollmentToken(ctx context.Context, enrollmentID int64, hash []byte, expiresAt time.Time) error
+	AddEnrollments(ctx context.Context, surveyID, ownerID int64, participants []domains.EnrollmentCreate, generator domains.EnrollmentTokenGenerator) ([]domains.EnrollmentInvitation, error)
+	RemoveEnrollment(ctx context.Context, surveyID, ownerID, enrollmentID int64) error
 	SubmitSurveyResponse(ctx context.Context, payload domains.SurveyResponseToSave) (domains.SurveyResponseResult, error)
 	GetSurveyResultByEnrollmentID(ctx context.Context, enrollmentID int64) (domains.SurveyResponseResult, error)
 	ListSurveyResults(ctx context.Context, ownerID int64, surveyID int64) ([]domains.SurveyResult, error)
 	GetSurveyStatistics(ctx context.Context, ownerID int64, surveyID int64) (domains.SurveyStatisticsCounts, error)
+	GetEnrollmentByID(ctx context.Context, enrollmentID int) (domains.Enrollment, error)
 }
 
 func NewSurveyService(provider SurveyProvider, templates TemplateProvider, secret string) *SurveyService {
@@ -97,6 +100,56 @@ func (h *SurveyService) CreateSurvey(ctx context.Context, payload domains.Survey
 	return domains.SurveyCreateResult{Survey: survey, Invitations: invites}, nil
 }
 
+func (h *SurveyService) AddSurveyParticipants(ctx context.Context, ownerID int, surveyID int, participants []domains.EnrollmentCreate) ([]domains.EnrollmentInvitation, error) {
+	if len(participants) == 0 {
+		return []domains.EnrollmentInvitation{}, nil
+	}
+
+	slog.Info("AddSurveyParticipants", "owner_id", ownerID, "survey_id", surveyID, "count", len(participants))
+
+	survey, err := h.provider.GetSurveyByID(ctx, ownerID, surveyID)
+	if err != nil {
+		slog.Error("GetSurveyByID failed", "err", err, "owner_id", ownerID, "survey_id", surveyID)
+		return nil, err
+	}
+
+	invitations, err := h.provider.AddEnrollments(ctx, survey.ID, survey.OwnerID, participants, h.buildToken)
+	if err != nil {
+		switch {
+		case errors.Is(err, storage.ErrConflict):
+			return nil, ErrSurveyParticipantExists
+		case errors.Is(err, storage.ErrNotFound):
+			return nil, storage.ErrNotFound
+		default:
+			slog.Error("AddEnrollments failed", "err", err, "owner_id", ownerID, "survey_id", surveyID)
+			return nil, err
+		}
+	}
+
+	return invitations, nil
+}
+
+func (h *SurveyService) RemoveSurveyParticipant(ctx context.Context, ownerID int, surveyID int, enrollmentID int) error {
+	slog.Info("RemoveSurveyParticipant", "owner_id", ownerID, "survey_id", surveyID, "enrollment_id", enrollmentID)
+
+	if _, err := h.provider.GetSurveyByID(ctx, ownerID, surveyID); err != nil {
+		slog.Error("GetSurveyByID failed", "err", err, "owner_id", ownerID, "survey_id", surveyID)
+		return err
+	}
+
+	if err := h.provider.RemoveEnrollment(ctx, int64(surveyID), int64(ownerID), int64(enrollmentID)); err != nil {
+		switch {
+		case errors.Is(err, storage.ErrNotFound):
+			return ErrSurveyParticipantNotFound
+		default:
+			slog.Error("RemoveEnrollment failed", "err", err, "owner_id", ownerID, "survey_id", surveyID, "enrollment_id", enrollmentID)
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (h *SurveyService) GetAllSurveysByUser(ctx context.Context, userId int) ([]domains.SurveySummary, error) {
 	surveys, err := h.provider.GetAllSurveysByUser(ctx, int64(userId))
 	if err != nil {
@@ -107,7 +160,7 @@ func (h *SurveyService) GetAllSurveysByUser(ctx context.Context, userId int) ([]
 }
 
 func (h *SurveyService) GetSurveyById(ctx context.Context, userId int, surveyId int) (domains.SurveyDetails, error) {
-	survey, err := h.provider.GetSurveyByID(ctx, int64(userId), int64(surveyId))
+	survey, err := h.provider.GetSurveyByID(ctx, userId, surveyId)
 	if err != nil {
 		slog.Error("GetSurveyById failed", "err", err, "user_id", userId, "survey_id", surveyId)
 		return domains.SurveyDetails{}, err
@@ -169,7 +222,7 @@ func (h *SurveyService) GetSurveyById(ctx context.Context, userId int, surveyId 
 }
 
 func (h *SurveyService) GetSurveyResults(ctx context.Context, userId int, surveyId int) (domains.SurveyResultsSummary, error) {
-	survey, err := h.provider.GetSurveyByID(ctx, int64(userId), int64(surveyId))
+	survey, err := h.provider.GetSurveyByID(ctx, userId, surveyId)
 	if err != nil {
 		slog.Error("GetSurveyResults get survey failed", "err", err, "user_id", userId, "survey_id", surveyId)
 		return domains.SurveyResultsSummary{}, err
@@ -187,9 +240,9 @@ func (h *SurveyService) GetSurveyResults(ctx context.Context, userId int, survey
 		return domains.SurveyResultsSummary{}, err
 	}
 	// TODO посмотреть как он себя ведет с результатами
-	for i := range results {
-		results[i].Survey = survey
-	}
+	//for i := range results {
+	//	results[i].Survey = survey
+	//}
 
 	return domains.SurveyResultsSummary{
 		Survey:     survey,
@@ -276,7 +329,6 @@ func (h *SurveyService) GetSurveyResultByToken(ctx context.Context, token string
 		case errors.Is(err, storage.ErrNotFound):
 			return domains.SurveyResult{}, ErrSurveyResponseNotFound
 		default:
-			slog.Error("GetSurveyResultByToken failed", "err", err, "enrollment_id", access.Enrollment.ID)
 			return domains.SurveyResult{}, err
 		}
 	}
@@ -284,6 +336,32 @@ func (h *SurveyService) GetSurveyResultByToken(ctx context.Context, token string
 	return domains.SurveyResult{
 		Survey:     access.Survey,
 		Enrollment: access.Enrollment,
+		Response:   result.Response,
+		Answers:    result.Answers,
+	}, nil
+}
+
+func (h *SurveyService) GetEnrollmentResultByID(ctx context.Context, userId, enrollmentID, surveyID int) (domains.SurveyResult, error) {
+	survey, err := h.provider.GetSurveyByID(ctx, userId, surveyID)
+	enrollment, err := h.provider.GetEnrollmentByID(ctx, enrollmentID)
+	slog.Info("survey", survey, "enrollment", enrollment)
+	if err != nil {
+		return domains.SurveyResult{}, err
+	}
+
+	result, err := h.provider.GetSurveyResultByEnrollmentID(ctx, int64(enrollmentID))
+	if err != nil {
+		switch {
+		case errors.Is(err, storage.ErrNotFound):
+			return domains.SurveyResult{}, ErrSurveyResponseNotFound
+		default:
+			return domains.SurveyResult{}, err
+		}
+	}
+
+	return domains.SurveyResult{
+		Survey:     survey,
+		Enrollment: enrollment,
 		Response:   result.Response,
 		Answers:    result.Answers,
 	}, nil

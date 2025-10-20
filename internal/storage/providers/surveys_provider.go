@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -120,6 +121,91 @@ func (s SurveyProvider) SaveSurvey(ctx context.Context, survey domains.SurveyToS
 	}
 
 	return created, invitations, nil
+}
+
+func (s SurveyProvider) AddEnrollments(ctx context.Context, surveyID, ownerID int64, participants []domains.EnrollmentCreate, generator domains.EnrollmentTokenGenerator) ([]domains.EnrollmentInvitation, error) {
+	if len(participants) == 0 {
+		return []domains.EnrollmentInvitation{}, nil
+	}
+
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var surveyExists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM surveys WHERE id = $1 AND owner_id = $2)`,
+		surveyID,
+		ownerID,
+	).Scan(&surveyExists); err != nil {
+		return nil, fmt.Errorf("verify survey ownership: %w", err)
+	}
+	if !surveyExists {
+		return nil, fmt.Errorf("verify survey ownership: %w", storage.ErrNotFound)
+	}
+
+	invitations := make([]domains.EnrollmentInvitation, 0, len(participants))
+
+	const insertEnrollment = `
+          INSERT INTO enrollments (
+              survey_id, source, full_name, email, phone,
+              telegram_chat_id, state, invited_by
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+          RETURNING id`
+
+	for _, participant := range participants {
+		var enrollmentID int64
+		err := tx.QueryRow(ctx, insertEnrollment,
+			surveyID,
+			"admin",
+			participant.FullName,
+			participant.Email,
+			participant.Phone,
+			participant.TelegramChatID,
+			"invited",
+			ownerID,
+		).Scan(&enrollmentID)
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return nil, fmt.Errorf("insert enrollment: %w", storage.ErrConflict)
+			}
+			return nil, fmt.Errorf("insert enrollment: %w", err)
+		}
+
+		token, hash, expiresAt, err := generator(domains.EnrollmentTokenPayload{
+			SurveyID:     surveyID,
+			EnrollmentID: enrollmentID,
+			OwnerID:      ownerID,
+			Enrollment:   participant,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("generate token: %w", err)
+		}
+
+		if _, err := tx.Exec(ctx,
+			`UPDATE enrollments SET token_hash = $1, token_expires_at = $2 WHERE id = $3`,
+			hash, expiresAt, enrollmentID,
+		); err != nil {
+			return nil, fmt.Errorf("update enrollment token: %w", err)
+		}
+
+		invitations = append(invitations, domains.EnrollmentInvitation{
+			EnrollmentID: enrollmentID,
+			Token:        token,
+			ExpiresAt:    expiresAt,
+			FullName:     participant.FullName,
+			Email:        participant.Email,
+		})
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
+
+	return invitations, nil
 }
 
 func (s SurveyProvider) GetAllSurveysByUser(ctx context.Context, userId int64) ([]domains.SurveySummary, error) {
@@ -257,7 +343,7 @@ func (s SurveyProvider) GetAllSurveysByUser(ctx context.Context, userId int64) (
 	return result, nil
 }
 
-func (s SurveyProvider) GetSurveyByID(ctx context.Context, ownerID int64, surveyID int64) (domains.Survey, error) {
+func (s SurveyProvider) GetSurveyByID(ctx context.Context, ownerID int, surveyID int) (domains.Survey, error) {
 	const query = `
 		SELECT
 			id, owner_id, template_id, snapshot_version,
@@ -315,6 +401,30 @@ func (s SurveyProvider) UpdateEnrollmentToken(ctx context.Context, enrollmentID 
 	if _, err := s.db.Exec(ctx, query, hash, expiresAt, enrollmentID); err != nil {
 		return fmt.Errorf("update enrollment token: %w", err)
 	}
+	return nil
+}
+
+func (s SurveyProvider) RemoveEnrollment(ctx context.Context, surveyID, ownerID, enrollmentID int64) error {
+	const query = `
+		UPDATE enrollments e
+		SET state = 'removed',
+		    token_hash = NULL,
+		    token_expires_at = NULL
+		FROM surveys s
+		WHERE e.id = $1
+		  AND e.survey_id = $2
+		  AND s.id = e.survey_id
+		  AND s.owner_id = $3
+		RETURNING e.id`
+
+	var updatedID int64
+	if err := s.db.QueryRow(ctx, query, enrollmentID, surveyID, ownerID).Scan(&updatedID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("remove enrollment: %w", storage.ErrNotFound)
+		}
+		return fmt.Errorf("remove enrollment: %w", err)
+	}
+
 	return nil
 }
 
@@ -679,7 +789,34 @@ func (s SurveyProvider) GetSurveyStatistics(ctx context.Context, ownerID int64, 
 
 	return stats, nil
 }
+func (s SurveyProvider) GetEnrollmentByID(ctx context.Context, enrollmentID int) (domains.Enrollment, error) {
+	slog.Info("enrollmentID", enrollmentID)
+	const query = `
+		SELECT 	e.id,
+			e.survey_id,
+			e.full_name,
+			e.email,
+			e.phone,
+			e.telegram_chat_id,
+			e.state,
+			e.token_hash,
+			e.token_expires_at,
+			e.use_limit,
+			e.used_count
+		FROM enrollments e
+		WHERE id = $1`
+	rows, err := s.db.Query(ctx, query, enrollmentID)
+	if err != nil {
+		return domains.Enrollment{}, fmt.Errorf("enrollment: %w", err)
+	}
+	defer rows.Close()
 
+	enrollment, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[domains.Enrollment])
+	if err := rows.Err(); err != nil {
+		return domains.Enrollment{}, fmt.Errorf("iterate enrollments: %w", err)
+	}
+	return enrollment, nil
+}
 func (s SurveyProvider) GetSurveyAccessByHash(ctx context.Context, id int) (domains.SurveyAccess, error) {
 
 	const query = `

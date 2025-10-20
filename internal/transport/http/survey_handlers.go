@@ -7,7 +7,11 @@ import (
 	"mymodule/internal/domains"
 	"mymodule/internal/httpx"
 	"mymodule/internal/service"
+	"mymodule/internal/storage"
 	"net/http"
+	"strconv"
+
+	"github.com/gorilla/mux"
 )
 
 type SurveyHandlers struct {
@@ -22,10 +26,21 @@ type SurveyServices interface {
 	AccessSurveyByToken(ctx context.Context, token string) (domains.SurveyAccess, error)
 	SubmitSurveyResponse(ctx context.Context, submission domains.SurveySubmission) (domains.SurveyResult, error)
 	GetSurveyResultByToken(ctx context.Context, token string) (domains.SurveyResult, error)
+	GetEnrollmentResultByID(ctx context.Context, ownerID, enrollmentID, surveyID int) (domains.SurveyResult, error)
+	AddSurveyParticipants(ctx context.Context, ownerID int, surveyID int, participants []domains.EnrollmentCreate) ([]domains.EnrollmentInvitation, error)
+	RemoveSurveyParticipant(ctx context.Context, ownerID int, surveyID int, enrollmentID int) error
 }
 
 func NewSurveyHandlers(service SurveyServices) *SurveyHandlers {
 	return &SurveyHandlers{service: service}
+}
+
+type addParticipantsRequest struct {
+	Participants []domains.EnrollmentCreate `json:"participants"`
+}
+
+type addParticipantsResponse struct {
+	Invitations []domains.EnrollmentInvitation `json:"invitations"`
 }
 
 func (h *SurveyHandlers) CreateSurvey(w http.ResponseWriter, r *http.Request) {
@@ -54,6 +69,46 @@ func (h *SurveyHandlers) CreateSurvey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httpx.JSON(w, http.StatusCreated, created)
+}
+
+func (h *SurveyHandlers) AddParticipants(w http.ResponseWriter, r *http.Request) {
+	surveyID := httpx.GetId(w, r)
+	if surveyID == 0 {
+		return
+	}
+
+	user, ok := httpx.UserIdFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	req, err := httpx.ReadBody[addParticipantsRequest](*r)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(req.Participants) == 0 {
+		httpx.Error(w, http.StatusBadRequest, "participants is required")
+		return
+	}
+
+	invitations, err := h.service.AddSurveyParticipants(r.Context(), user, int(surveyID), req.Participants)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrSurveyParticipantExists):
+			httpx.Error(w, http.StatusConflict, "Участник уже добавлен")
+		case errors.Is(err, storage.ErrNotFound):
+			httpx.Error(w, http.StatusNotFound, "Анкета не найдена")
+		default:
+			slog.Error("AddSurveyParticipants failed", "err", err, "user", user, "survey", surveyID)
+			httpx.Error(w, http.StatusInternalServerError, "Не удалось добавить участников")
+		}
+		return
+	}
+
+	response := addParticipantsResponse{Invitations: invitations}
+	httpx.JSON(w, http.StatusCreated, response)
 }
 
 func (h *SurveyHandlers) GetAllSurveysByUser(w http.ResponseWriter, r *http.Request) {
@@ -90,6 +145,45 @@ func (h *SurveyHandlers) GetSurveyById(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httpx.JSON(w, http.StatusOK, details)
+}
+
+func (h *SurveyHandlers) RemoveParticipant(w http.ResponseWriter, r *http.Request) {
+	surveyID := httpx.GetId(w, r)
+	if surveyID == 0 {
+		return
+	}
+
+	user, ok := httpx.UserIdFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	vars := mux.Vars(r)
+	participantIDStr, ok := vars["participantId"]
+	if !ok {
+		httpx.Error(w, http.StatusBadRequest, "participant_id is required")
+		return
+	}
+
+	participantID, err := strconv.Atoi(participantIDStr)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "Некорректный идентификатор участника")
+		return
+	}
+
+	if err := h.service.RemoveSurveyParticipant(r.Context(), user, int(surveyID), participantID); err != nil {
+		switch {
+		case errors.Is(err, service.ErrSurveyParticipantNotFound), errors.Is(err, storage.ErrNotFound):
+			httpx.Error(w, http.StatusNotFound, "Участник не найден")
+		default:
+			slog.Error("RemoveSurveyParticipant failed", "err", err, "user", user, "survey", surveyID, "participant", participantID)
+			httpx.Error(w, http.StatusInternalServerError, "Не удалось удалить участника")
+		}
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *SurveyHandlers) GetSurveyResults(w http.ResponseWriter, r *http.Request) {
@@ -149,6 +243,7 @@ func (h *SurveyHandlers) AccessSurveyByToken(w http.ResponseWriter, r *http.Requ
 func (h *SurveyHandlers) SubmitSurveyResponse(w http.ResponseWriter, r *http.Request) {
 	submission, err := httpx.ReadBody[domains.SurveySubmission](*r)
 	if err != nil {
+
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -159,6 +254,7 @@ func (h *SurveyHandlers) SubmitSurveyResponse(w http.ResponseWriter, r *http.Req
 
 	result, err := h.service.SubmitSurveyResponse(r.Context(), submission)
 	if err != nil {
+		slog.Error("SubmitSurveyResponse failed", "err", err, "submission", submission)
 		switch {
 		case errors.Is(err, service.ErrSurveyTokenInvalid):
 			httpx.Error(w, http.StatusUnauthorized, "Недействительный токен")
@@ -178,14 +274,14 @@ func (h *SurveyHandlers) SubmitSurveyResponse(w http.ResponseWriter, r *http.Req
 
 func (h *SurveyHandlers) GetSurveyResult(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
-	if token == "" && r.Method != http.MethodGet {
-		request, err := httpx.ReadBody[domains.SurveyAccessRequest](*r)
-		if err != nil {
-			httpx.Error(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		token = request.Token
-	}
+	//if token == "" && r.Method != http.MethodGet {
+	//	request, err := httpx.ReadBody[domains.SurveyAccessRequest](*r)
+	//	if err != nil {
+	//		httpx.Error(w, http.StatusBadRequest, err.Error())
+	//		return
+	//	}
+	//	token = request.Token
+	//}
 	if token == "" {
 		httpx.Error(w, http.StatusBadRequest, "token is required")
 		return
@@ -206,6 +302,31 @@ func (h *SurveyHandlers) GetSurveyResult(w http.ResponseWriter, r *http.Request)
 		}
 		return
 	}
+
+	httpx.JSON(w, http.StatusOK, result)
+}
+func (h *SurveyHandlers) GetEnrollmentResultByID(w http.ResponseWriter, r *http.Request) {
+	enrollmentID := r.URL.Query().Get("enrollment")
+	surveyID := r.URL.Query().Get("survey")
+	userID, ok := httpx.UserIdFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "не авторизован")
+	}
+
+	if enrollmentID == "" || surveyID == "" {
+		httpx.Error(w, http.StatusBadRequest, "enrollmentID и surveyID обязательны")
+	}
+	enrollmentIDInt, err := strconv.Atoi(enrollmentID)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "enrollmentID не валиден")
+	}
+	surveyIDInt, err := strconv.Atoi(surveyID)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "surveyID не валиден")
+	}
+	slog.Info("GetEnrollmentResultByID", "enrollmentID", enrollmentIDInt, "surveyID", surveyIDInt)
+
+	result, err := h.service.GetEnrollmentResultByID(r.Context(), userID, enrollmentIDInt, surveyIDInt)
 
 	httpx.JSON(w, http.StatusOK, result)
 }
