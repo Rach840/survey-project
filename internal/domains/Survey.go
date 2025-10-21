@@ -33,6 +33,20 @@ type SurveyCreate struct {
 	Participants    []EnrollmentCreate `json:"participants"`
 }
 
+type SurveyUpdate struct {
+	Title           *string        `json:"title,omitempty"`
+	Mode            *string        `json:"invitationMode,omitempty"`
+	Status          *string        `json:"status,omitempty"`
+	MaxParticipants OptionalInt    `json:"max_participants"`
+	PublicSlug      OptionalString `json:"public_slug"`
+	StartsAt        OptionalTime   `json:"starts_at"`
+	EndsAt          OptionalTime   `json:"ends_at"`
+}
+
+func (u SurveyUpdate) HasChanges() bool {
+	return u.Title != nil || u.Mode != nil || u.Status != nil || u.MaxParticipants.Present || u.PublicSlug.Present || u.StartsAt.Present || u.EndsAt.Present
+}
+
 type SurveyToSave struct {
 	OwnerID          int64
 	TemplateID       int64
@@ -69,10 +83,27 @@ type SurveyCreateResult struct {
 }
 
 type EnrollmentTokenPayload struct {
-	SurveyID     int64
-	EnrollmentID int64
-	OwnerID      int64
-	Enrollment   EnrollmentCreate
+	SurveyID       int64
+	EnrollmentID   int64
+	OwnerID        int64
+	Enrollment     EnrollmentCreate
+	SurveyStartsAt *time.Time
+	SurveyEndsAt   *time.Time
+}
+
+type OptionalTime struct {
+	Present bool
+	Value   *time.Time
+}
+
+type OptionalInt struct {
+	Present bool
+	Value   *int
+}
+
+type OptionalString struct {
+	Present bool
+	Value   *string
 }
 
 type EnrollmentTokenGenerator func(payload EnrollmentTokenPayload) (token string, hash []byte, expiresAt time.Time, err error)

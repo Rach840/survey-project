@@ -49,11 +49,11 @@ func Router(db *pgxpool.Pool, cfg *config.Config) *mux.Router {
 	survey.HandleFunc("/create", surveyHandler.CreateSurvey).Methods(http.MethodPost)
 	survey.HandleFunc("/", surveyHandler.GetAllSurveysByUser).Methods(http.MethodGet)
 	survey.HandleFunc("/result", surveyHandler.GetEnrollmentResultByID).Methods(http.MethodGet)
-	survey.HandleFunc("/{id}/participants", surveyHandler.AddParticipants).Methods(http.MethodPost)
+	survey.HandleFunc("/{id}/participants", surveyHandler.AddParticipant).Methods(http.MethodPost)
 	survey.HandleFunc("/{id}/participants/{participantId}", surveyHandler.RemoveParticipant).Methods(http.MethodDelete)
 	survey.HandleFunc("/{id}/results", surveyHandler.GetSurveyResults).Methods(http.MethodGet)
 	survey.HandleFunc("/{id}", surveyHandler.GetSurveyById).Methods(http.MethodGet)
-	survey.HandleFunc("/{id}", surveyHandler.GetSurveyById).Methods(http.MethodPatch)
+	survey.HandleFunc("/{id}", surveyHandler.UpdateSurveyById).Methods(http.MethodPatch)
 
 	return router
 }

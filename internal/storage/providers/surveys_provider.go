@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"mymodule/internal/domains"
 	"mymodule/internal/storage"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -91,10 +92,12 @@ func (s SurveyProvider) SaveSurvey(ctx context.Context, survey domains.SurveyToS
 		}
 
 		token, hash, expiresAt, err := generator(domains.EnrollmentTokenPayload{
-			SurveyID:     created.ID,
-			EnrollmentID: enrollmentID,
-			OwnerID:      created.OwnerID,
-			Enrollment:   participant,
+			SurveyID:       created.ID,
+			EnrollmentID:   enrollmentID,
+			OwnerID:        created.OwnerID,
+			Enrollment:     participant,
+			SurveyStartsAt: created.StartsAt,
+			SurveyEndsAt:   created.EndsAt,
 		})
 		if err != nil {
 			return domains.Survey{}, nil, fmt.Errorf("generate token: %w", err)
@@ -123,30 +126,28 @@ func (s SurveyProvider) SaveSurvey(ctx context.Context, survey domains.SurveyToS
 	return created, invitations, nil
 }
 
-func (s SurveyProvider) AddEnrollments(ctx context.Context, surveyID, ownerID int64, participants []domains.EnrollmentCreate, generator domains.EnrollmentTokenGenerator) ([]domains.EnrollmentInvitation, error) {
-	if len(participants) == 0 {
-		return []domains.EnrollmentInvitation{}, nil
-	}
+func (s SurveyProvider) AddEnrollments(ctx context.Context, surveyID, ownerID int64, participant domains.EnrollmentCreate, generator domains.EnrollmentTokenGenerator) (domains.EnrollmentInvitation, error) {
 
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
+		return domains.EnrollmentInvitation{}, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	var surveyExists bool
+	surveyWindow := struct {
+		StartsAt *time.Time
+		EndsAt   *time.Time
+	}{}
 	if err := tx.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM surveys WHERE id = $1 AND owner_id = $2)`,
+		`SELECT starts_at, ends_at FROM surveys WHERE id = $1 AND owner_id = $2`,
 		surveyID,
 		ownerID,
-	).Scan(&surveyExists); err != nil {
-		return nil, fmt.Errorf("verify survey ownership: %w", err)
+	).Scan(&surveyWindow.StartsAt, &surveyWindow.EndsAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domains.EnrollmentInvitation{}, fmt.Errorf("verify survey ownership: %w", storage.ErrNotFound)
+		}
+		return domains.EnrollmentInvitation{}, fmt.Errorf("verify survey ownership: %w", err)
 	}
-	if !surveyExists {
-		return nil, fmt.Errorf("verify survey ownership: %w", storage.ErrNotFound)
-	}
-
-	invitations := make([]domains.EnrollmentInvitation, 0, len(participants))
 
 	const insertEnrollment = `
           INSERT INTO enrollments (
@@ -155,57 +156,146 @@ func (s SurveyProvider) AddEnrollments(ctx context.Context, surveyID, ownerID in
           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
           RETURNING id`
 
-	for _, participant := range participants {
-		var enrollmentID int64
-		err := tx.QueryRow(ctx, insertEnrollment,
-			surveyID,
-			"admin",
-			participant.FullName,
-			participant.Email,
-			participant.Phone,
-			participant.TelegramChatID,
-			"invited",
-			ownerID,
-		).Scan(&enrollmentID)
-		if err != nil {
-			var pgErr *pgconn.PgError
-			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-				return nil, fmt.Errorf("insert enrollment: %w", storage.ErrConflict)
-			}
-			return nil, fmt.Errorf("insert enrollment: %w", err)
-		}
+	var enrollmentID int64
 
-		token, hash, expiresAt, err := generator(domains.EnrollmentTokenPayload{
-			SurveyID:     surveyID,
-			EnrollmentID: enrollmentID,
-			OwnerID:      ownerID,
-			Enrollment:   participant,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("generate token: %w", err)
+	err = tx.QueryRow(ctx, insertEnrollment,
+		surveyID,
+		"admin",
+		participant.FullName,
+		participant.Email,
+		participant.Phone,
+		participant.TelegramChatID,
+		"invited",
+		ownerID,
+	).Scan(&enrollmentID)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return domains.EnrollmentInvitation{}, fmt.Errorf("insert enrollment: %w", storage.ErrConflict)
 		}
-
-		if _, err := tx.Exec(ctx,
-			`UPDATE enrollments SET token_hash = $1, token_expires_at = $2 WHERE id = $3`,
-			hash, expiresAt, enrollmentID,
-		); err != nil {
-			return nil, fmt.Errorf("update enrollment token: %w", err)
-		}
-
-		invitations = append(invitations, domains.EnrollmentInvitation{
-			EnrollmentID: enrollmentID,
-			Token:        token,
-			ExpiresAt:    expiresAt,
-			FullName:     participant.FullName,
-			Email:        participant.Email,
-		})
+		return domains.EnrollmentInvitation{}, fmt.Errorf("insert enrollment: %w", err)
 	}
 
+	token, hash, expiresAt, err := generator(domains.EnrollmentTokenPayload{
+		SurveyID:       surveyID,
+		EnrollmentID:   enrollmentID,
+		OwnerID:        ownerID,
+		Enrollment:     participant,
+		SurveyStartsAt: surveyWindow.StartsAt,
+		SurveyEndsAt:   surveyWindow.EndsAt,
+	})
+	if err != nil {
+		return domains.EnrollmentInvitation{}, fmt.Errorf("generate token: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE enrollments SET token_hash = $1, token_expires_at = $2 WHERE id = $3`,
+		hash, expiresAt, enrollmentID,
+	); err != nil {
+		return domains.EnrollmentInvitation{}, fmt.Errorf("update enrollment token: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit: %w", err)
+		return domains.EnrollmentInvitation{}, fmt.Errorf("commit: %w", err)
 	}
 
-	return invitations, nil
+	return domains.EnrollmentInvitation{
+		EnrollmentID: enrollmentID,
+		Token:        token,
+		ExpiresAt:    expiresAt,
+		FullName:     participant.FullName,
+		Email:        participant.Email,
+	}, nil
+}
+
+func (s SurveyProvider) UpdateSurvey(ctx context.Context, surveyID, ownerID int64, update domains.SurveyUpdate) (domains.Survey, error) {
+	setClauses := make([]string, 0, 7)
+	args := make([]interface{}, 0, 9)
+	idx := 1
+
+	if update.Title != nil {
+		setClauses = append(setClauses, fmt.Sprintf("title = $%d", idx))
+		args = append(args, *update.Title)
+		idx++
+	}
+	if update.Mode != nil {
+		setClauses = append(setClauses, fmt.Sprintf("mode = $%d", idx))
+		args = append(args, *update.Mode)
+		idx++
+	}
+	if update.Status != nil {
+		setClauses = append(setClauses, fmt.Sprintf("status = $%d", idx))
+		args = append(args, *update.Status)
+		idx++
+	}
+	if update.MaxParticipants.Present {
+		setClauses = append(setClauses, fmt.Sprintf("max_participants = $%d", idx))
+		if update.MaxParticipants.Value != nil {
+			args = append(args, *update.MaxParticipants.Value)
+		} else {
+			args = append(args, nil)
+		}
+		idx++
+	}
+	if update.PublicSlug.Present {
+		setClauses = append(setClauses, fmt.Sprintf("public_slug = $%d", idx))
+		if update.PublicSlug.Value != nil {
+			args = append(args, *update.PublicSlug.Value)
+		} else {
+			args = append(args, nil)
+		}
+		idx++
+	}
+	if update.StartsAt.Present {
+		setClauses = append(setClauses, fmt.Sprintf("starts_at = $%d", idx))
+		if update.StartsAt.Value != nil {
+			args = append(args, *update.StartsAt.Value)
+		} else {
+			args = append(args, nil)
+		}
+		idx++
+	}
+	if update.EndsAt.Present {
+		setClauses = append(setClauses, fmt.Sprintf("ends_at = $%d", idx))
+		if update.EndsAt.Value != nil {
+			args = append(args, *update.EndsAt.Value)
+		} else {
+			args = append(args, nil)
+		}
+		idx++
+	}
+
+	if len(setClauses) == 0 {
+		return s.GetSurveyByID(ctx, int(ownerID), int(surveyID))
+	}
+
+	setClauses = append(setClauses, "updated_at = now()")
+	args = append(args, surveyID, ownerID)
+	query := fmt.Sprintf(`
+		UPDATE surveys
+		SET %s
+		WHERE id = $%d AND owner_id = $%d
+		RETURNING
+			id, owner_id, template_id, snapshot_version,
+			form_snapshot_json, title, mode, status,
+			max_participants, public_slug, starts_at, ends_at, created_at`,
+		strings.Join(setClauses, ", "), idx, idx+1,
+	)
+
+	rows, err := s.db.Query(ctx, query, args...)
+	if err != nil {
+		return domains.Survey{}, fmt.Errorf("update survey: %w", err)
+	}
+	defer rows.Close()
+
+	updated, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[domains.Survey])
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domains.Survey{}, fmt.Errorf("update survey: %w", storage.ErrNotFound)
+		}
+		return domains.Survey{}, fmt.Errorf("update survey: %w", err)
+	}
+
+	return updated, nil
 }
 
 func (s SurveyProvider) GetAllSurveysByUser(ctx context.Context, userId int64) ([]domains.SurveySummary, error) {

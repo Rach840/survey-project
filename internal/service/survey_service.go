@@ -30,8 +30,9 @@ type SurveyProvider interface {
 	GetSurveyAccessByHash(ctx context.Context, id int) (domains.SurveyAccess, error)
 	ListEnrollmentsBySurveyID(ctx context.Context, ownerID int64, surveyID int64) ([]domains.Enrollment, error)
 	UpdateEnrollmentToken(ctx context.Context, enrollmentID int64, hash []byte, expiresAt time.Time) error
-	AddEnrollments(ctx context.Context, surveyID, ownerID int64, participants []domains.EnrollmentCreate, generator domains.EnrollmentTokenGenerator) ([]domains.EnrollmentInvitation, error)
+	AddEnrollments(ctx context.Context, surveyID, ownerID int64, participants domains.EnrollmentCreate, generator domains.EnrollmentTokenGenerator) (domains.EnrollmentInvitation, error)
 	RemoveEnrollment(ctx context.Context, surveyID, ownerID, enrollmentID int64) error
+	UpdateSurvey(ctx context.Context, surveyID, ownerID int64, update domains.SurveyUpdate) (domains.Survey, error)
 	SubmitSurveyResponse(ctx context.Context, payload domains.SurveyResponseToSave) (domains.SurveyResponseResult, error)
 	GetSurveyResultByEnrollmentID(ctx context.Context, enrollmentID int64) (domains.SurveyResponseResult, error)
 	ListSurveyResults(ctx context.Context, ownerID int64, surveyID int64) ([]domains.SurveyResult, error)
@@ -75,6 +76,12 @@ func (h *SurveyService) CreateSurvey(ctx context.Context, payload domains.Survey
 	if title == "" {
 		title = template.Title
 	}
+	if payload.StartsAt != nil && payload.EndsAt != nil && (payload.EndsAt.Equal(*payload.StartsAt) || payload.EndsAt.Before(*payload.StartsAt)) {
+		return domains.SurveyCreateResult{}, ErrSurveyScheduleInvalid
+	}
+	if payload.EndsAt != nil && payload.EndsAt.Before(time.Now()) {
+		return domains.SurveyCreateResult{}, ErrSurveyScheduleInvalid
+	}
 
 	toSave := domains.SurveyToSave{
 		OwnerID:          int64(userId),
@@ -93,6 +100,9 @@ func (h *SurveyService) CreateSurvey(ctx context.Context, payload domains.Survey
 
 	survey, invites, err := h.provider.SaveSurvey(ctx, toSave, h.buildToken)
 	if err != nil {
+		if errors.Is(err, ErrSurveyTokenExpired) {
+			return domains.SurveyCreateResult{}, ErrSurveyScheduleInvalid
+		}
 		slog.Error("Save survey error", "err", err)
 		return domains.SurveyCreateResult{}, err
 	}
@@ -100,29 +110,29 @@ func (h *SurveyService) CreateSurvey(ctx context.Context, payload domains.Survey
 	return domains.SurveyCreateResult{Survey: survey, Invitations: invites}, nil
 }
 
-func (h *SurveyService) AddSurveyParticipants(ctx context.Context, ownerID int, surveyID int, participants []domains.EnrollmentCreate) ([]domains.EnrollmentInvitation, error) {
-	if len(participants) == 0 {
-		return []domains.EnrollmentInvitation{}, nil
-	}
-
-	slog.Info("AddSurveyParticipants", "owner_id", ownerID, "survey_id", surveyID, "count", len(participants))
+func (h *SurveyService) AddSurveyParticipant(ctx context.Context, ownerID int, surveyID int, participant domains.EnrollmentCreate) (domains.EnrollmentInvitation, error) {
 
 	survey, err := h.provider.GetSurveyByID(ctx, ownerID, surveyID)
 	if err != nil {
 		slog.Error("GetSurveyByID failed", "err", err, "owner_id", ownerID, "survey_id", surveyID)
-		return nil, err
+		return domains.EnrollmentInvitation{}, err
+	}
+	if survey.EndsAt != nil && time.Now().After(*survey.EndsAt) {
+		return domains.EnrollmentInvitation{}, ErrSurveyTokenExpired
 	}
 
-	invitations, err := h.provider.AddEnrollments(ctx, survey.ID, survey.OwnerID, participants, h.buildToken)
+	invitations, err := h.provider.AddEnrollments(ctx, survey.ID, survey.OwnerID, participant, h.buildToken)
 	if err != nil {
 		switch {
 		case errors.Is(err, storage.ErrConflict):
-			return nil, ErrSurveyParticipantExists
+			return domains.EnrollmentInvitation{}, ErrSurveyParticipantExists
 		case errors.Is(err, storage.ErrNotFound):
-			return nil, storage.ErrNotFound
+			return domains.EnrollmentInvitation{}, storage.ErrNotFound
+		case errors.Is(err, ErrSurveyTokenExpired):
+			return domains.EnrollmentInvitation{}, ErrSurveyTokenExpired
 		default:
 			slog.Error("AddEnrollments failed", "err", err, "owner_id", ownerID, "survey_id", surveyID)
-			return nil, err
+			return domains.EnrollmentInvitation{}, err
 		}
 	}
 
@@ -148,6 +158,50 @@ func (h *SurveyService) RemoveSurveyParticipant(ctx context.Context, ownerID int
 	}
 
 	return nil
+}
+
+func (h *SurveyService) UpdateSurvey(ctx context.Context, ownerID int, surveyID int, update domains.SurveyUpdate) (domains.Survey, error) {
+	if !update.HasChanges() {
+		return h.provider.GetSurveyByID(ctx, ownerID, surveyID)
+	}
+
+	existing, err := h.provider.GetSurveyByID(ctx, ownerID, surveyID)
+	if err != nil {
+		slog.Error("UpdateSurvey fetch", "err", err, "owner_id", ownerID, "survey_id", surveyID)
+		if errors.Is(err, storage.ErrNotFound) {
+			return domains.Survey{}, storage.ErrNotFound
+		}
+		return domains.Survey{}, err
+	}
+
+	updatedStarts := existing.StartsAt
+	if update.StartsAt.Present {
+		updatedStarts = update.StartsAt.Value
+	}
+	updatedEnds := existing.EndsAt
+	if update.EndsAt.Present {
+		updatedEnds = update.EndsAt.Value
+	}
+
+	if updatedStarts != nil && updatedEnds != nil && (updatedEnds.Equal(*updatedStarts) || updatedEnds.Before(*updatedStarts)) {
+		return domains.Survey{}, ErrSurveyScheduleInvalid
+	}
+	if updatedEnds != nil && updatedEnds.Before(time.Now()) {
+		return domains.Survey{}, ErrSurveyScheduleInvalid
+	}
+
+	result, err := h.provider.UpdateSurvey(ctx, int64(surveyID), int64(ownerID), update)
+	if err != nil {
+		switch {
+		case errors.Is(err, storage.ErrNotFound):
+			return domains.Survey{}, storage.ErrNotFound
+		default:
+			slog.Error("UpdateSurvey failed", "err", err, "owner_id", ownerID, "survey_id", surveyID)
+			return domains.Survey{}, err
+		}
+	}
+
+	return result, nil
 }
 
 func (h *SurveyService) GetAllSurveysByUser(ctx context.Context, userId int) ([]domains.SurveySummary, error) {
@@ -184,9 +238,11 @@ func (h *SurveyService) GetSurveyById(ctx context.Context, userId int, surveyId 
 		}
 
 		payload := domains.EnrollmentTokenPayload{
-			SurveyID:     survey.ID,
-			EnrollmentID: enrollment.ID,
-			OwnerID:      survey.OwnerID,
+			SurveyID:       survey.ID,
+			EnrollmentID:   enrollment.ID,
+			OwnerID:        survey.OwnerID,
+			SurveyStartsAt: survey.StartsAt,
+			SurveyEndsAt:   survey.EndsAt,
 			Enrollment: domains.EnrollmentCreate{
 				FullName:       enrollment.FullName,
 				Email:          enrollment.Email,
@@ -196,6 +252,9 @@ func (h *SurveyService) GetSurveyById(ctx context.Context, userId int, surveyId 
 		}
 		token, hash, expiresAt, err := h.buildToken(payload)
 		if err != nil {
+			if errors.Is(err, ErrSurveyTokenExpired) {
+				continue
+			}
 			slog.Error("buildToken failed", "err", err, "enrollment_id", enrollment.ID)
 			return domains.SurveyDetails{}, err
 		}
@@ -455,7 +514,14 @@ func isEnrollmentTokenAllowed(state string) bool {
 }
 
 func (h *SurveyService) buildToken(payload domains.EnrollmentTokenPayload) (string, []byte, time.Time, error) {
-	expiresAt := time.Now().UTC().Add(h.invitationTTL)
+	now := time.Now().UTC()
+	expiresAt := now.Add(h.invitationTTL)
+	if payload.SurveyEndsAt != nil {
+		expiresAt = payload.SurveyEndsAt.UTC()
+	}
+	if !expiresAt.After(now) {
+		return "", nil, expiresAt, ErrSurveyTokenExpired
+	}
 
 	claims := jwt.MapClaims{
 		"sub":       strconv.FormatInt(payload.EnrollmentID, 10),
@@ -463,7 +529,10 @@ func (h *SurveyService) buildToken(payload domains.EnrollmentTokenPayload) (stri
 		"owner_id":  payload.OwnerID,
 		"type":      "survey_invitation",
 		"exp":       expiresAt.Unix(),
-		"issued_at": time.Now().UTC().Unix(),
+		"issued_at": now.Unix(),
+	}
+	if payload.SurveyStartsAt != nil {
+		claims["nbf"] = payload.SurveyStartsAt.UTC().Unix()
 	}
 	if payload.Enrollment.FullName != "" {
 		claims["name"] = payload.Enrollment.FullName

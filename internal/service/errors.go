@@ -8,6 +8,7 @@ var (
 	ErrSurveyTokenInvalid        = errors.New("survey token invalid")
 	ErrSurveyTokenExpired        = errors.New("survey token expired")
 	ErrSurveyTokenUsed           = errors.New("survey token usage limit reached")
+	ErrSurveyScheduleInvalid     = errors.New("survey schedule invalid")
 	ErrSurveyResponseNotFound    = errors.New("survey response not found")
 	ErrSurveyParticipantExists   = errors.New("survey participant already exists")
 	ErrSurveyParticipantNotFound = errors.New("survey participant not found")

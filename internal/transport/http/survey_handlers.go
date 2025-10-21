@@ -21,26 +21,19 @@ type SurveyHandlers struct {
 type SurveyServices interface {
 	CreateSurvey(ctx context.Context, survey domains.SurveyCreate, userId int) (domains.SurveyCreateResult, error)
 	GetAllSurveysByUser(ctx context.Context, userId int) ([]domains.SurveySummary, error)
-	GetSurveyById(ctx context.Context, userId int, surveyId int) (domains.SurveyDetails, error)
-	GetSurveyResults(ctx context.Context, userId int, surveyId int) (domains.SurveyResultsSummary, error)
+	GetSurveyById(ctx context.Context, userId, surveyId int) (domains.SurveyDetails, error)
+	GetSurveyResults(ctx context.Context, userId, surveyId int) (domains.SurveyResultsSummary, error)
 	AccessSurveyByToken(ctx context.Context, token string) (domains.SurveyAccess, error)
 	SubmitSurveyResponse(ctx context.Context, submission domains.SurveySubmission) (domains.SurveyResult, error)
 	GetSurveyResultByToken(ctx context.Context, token string) (domains.SurveyResult, error)
 	GetEnrollmentResultByID(ctx context.Context, ownerID, enrollmentID, surveyID int) (domains.SurveyResult, error)
-	AddSurveyParticipants(ctx context.Context, ownerID int, surveyID int, participants []domains.EnrollmentCreate) ([]domains.EnrollmentInvitation, error)
-	RemoveSurveyParticipant(ctx context.Context, ownerID int, surveyID int, enrollmentID int) error
+	AddSurveyParticipant(ctx context.Context, ownerID, surveyID int, participants domains.EnrollmentCreate) (domains.EnrollmentInvitation, error)
+	RemoveSurveyParticipant(ctx context.Context, ownerID, surveyID, enrollmentID int) error
+	UpdateSurvey(ctx context.Context, ownerID, surveyID int, update domains.SurveyUpdate) (domains.Survey, error)
 }
 
 func NewSurveyHandlers(service SurveyServices) *SurveyHandlers {
 	return &SurveyHandlers{service: service}
-}
-
-type addParticipantsRequest struct {
-	Participants []domains.EnrollmentCreate `json:"participants"`
-}
-
-type addParticipantsResponse struct {
-	Invitations []domains.EnrollmentInvitation `json:"invitations"`
 }
 
 func (h *SurveyHandlers) CreateSurvey(w http.ResponseWriter, r *http.Request) {
@@ -63,6 +56,11 @@ func (h *SurveyHandlers) CreateSurvey(w http.ResponseWriter, r *http.Request) {
 
 	created, err := h.service.CreateSurvey(r.Context(), surveyData, user)
 	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrSurveyScheduleInvalid):
+			httpx.Error(w, http.StatusBadRequest, "Некорректный период проведения анкеты")
+			return
+		}
 		slog.Error("CreateSurvey failed", "err", err)
 		httpx.Error(w, http.StatusInternalServerError, "Не удалось создать анкету")
 		return
@@ -71,7 +69,7 @@ func (h *SurveyHandlers) CreateSurvey(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusCreated, created)
 }
 
-func (h *SurveyHandlers) AddParticipants(w http.ResponseWriter, r *http.Request) {
+func (h *SurveyHandlers) AddParticipant(w http.ResponseWriter, r *http.Request) {
 	surveyID := httpx.GetId(w, r)
 	if surveyID == 0 {
 		return
@@ -83,21 +81,19 @@ func (h *SurveyHandlers) AddParticipants(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	req, err := httpx.ReadBody[addParticipantsRequest](*r)
+	req, err := httpx.ReadBody[domains.EnrollmentCreate](*r)
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if len(req.Participants) == 0 {
-		httpx.Error(w, http.StatusBadRequest, "participants is required")
-		return
-	}
 
-	invitations, err := h.service.AddSurveyParticipants(r.Context(), user, int(surveyID), req.Participants)
+	invitation, err := h.service.AddSurveyParticipant(r.Context(), user, int(surveyID), req)
 	if err != nil {
 		switch {
 		case errors.Is(err, service.ErrSurveyParticipantExists):
 			httpx.Error(w, http.StatusConflict, "Участник уже добавлен")
+		case errors.Is(err, service.ErrSurveyTokenExpired):
+			httpx.Error(w, http.StatusBadRequest, "Анкета уже завершена")
 		case errors.Is(err, storage.ErrNotFound):
 			httpx.Error(w, http.StatusNotFound, "Анкета не найдена")
 		default:
@@ -107,8 +103,7 @@ func (h *SurveyHandlers) AddParticipants(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	response := addParticipantsResponse{Invitations: invitations}
-	httpx.JSON(w, http.StatusCreated, response)
+	httpx.JSON(w, http.StatusCreated, invitation)
 }
 
 func (h *SurveyHandlers) GetAllSurveysByUser(w http.ResponseWriter, r *http.Request) {
@@ -329,4 +324,39 @@ func (h *SurveyHandlers) GetEnrollmentResultByID(w http.ResponseWriter, r *http.
 	result, err := h.service.GetEnrollmentResultByID(r.Context(), userID, enrollmentIDInt, surveyIDInt)
 
 	httpx.JSON(w, http.StatusOK, result)
+}
+
+func (h *SurveyHandlers) UpdateSurveyById(w http.ResponseWriter, r *http.Request) {
+	surveyID := httpx.GetId(w, r)
+	if surveyID == 0 {
+		return
+	}
+
+	ownerID, ok := httpx.UserIdFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	payload, err := httpx.ReadBody[domains.SurveyUpdate](*r)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	updated, err := h.service.UpdateSurvey(r.Context(), ownerID, int(surveyID), payload)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrSurveyScheduleInvalid):
+			httpx.Error(w, http.StatusBadRequest, "Некорректный период проведения анкеты")
+		case errors.Is(err, storage.ErrNotFound):
+			httpx.Error(w, http.StatusNotFound, "Анкета не найдена")
+		default:
+			slog.Error("UpdateSurvey failed", "err", err, "owner_id", ownerID, "survey_id", surveyID)
+			httpx.Error(w, http.StatusInternalServerError, "Не удалось обновить анкету")
+		}
+		return
+	}
+
+	httpx.JSON(w, http.StatusOK, updated)
 }
