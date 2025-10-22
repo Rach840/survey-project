@@ -24,12 +24,14 @@ type SurveyServices interface {
 	GetSurveyById(ctx context.Context, userId, surveyId int) (domains.SurveyDetails, error)
 	GetSurveyResults(ctx context.Context, userId, surveyId int) (domains.SurveyResultsSummary, error)
 	AccessSurveyByToken(ctx context.Context, token string) (domains.SurveyAccess, error)
+	StartSurveyByToken(ctx context.Context, request domains.SurveyStartRequest) (domains.SurveyStartResponse, error)
 	SubmitSurveyResponse(ctx context.Context, submission domains.SurveySubmission) (domains.SurveyResult, error)
 	GetSurveyResultByToken(ctx context.Context, token string) (domains.SurveyResult, error)
 	GetEnrollmentResultByID(ctx context.Context, ownerID, enrollmentID, surveyID int) (domains.SurveyResult, error)
 	AddSurveyParticipant(ctx context.Context, ownerID, surveyID int, participants domains.EnrollmentCreate) (domains.EnrollmentInvitation, error)
 	RemoveSurveyParticipant(ctx context.Context, ownerID, surveyID, enrollmentID int) error
 	UpdateSurvey(ctx context.Context, ownerID, surveyID int, update domains.SurveyUpdate) (domains.Survey, error)
+	ExtendEnrollmentToken(ctx context.Context, ownerID int, surveyID int, update domains.EnrollmentTokenUpdate) (domains.EnrollmentTokenUpdateResult, error)
 }
 
 func NewSurveyHandlers(service SurveyServices) *SurveyHandlers {
@@ -138,7 +140,7 @@ func (h *SurveyHandlers) GetSurveyById(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "Не удалось получить анкету")
 		return
 	}
-
+	slog.Info("survey", details)
 	httpx.JSON(w, http.StatusOK, details)
 }
 
@@ -233,6 +235,78 @@ func (h *SurveyHandlers) AccessSurveyByToken(w http.ResponseWriter, r *http.Requ
 	}
 
 	httpx.JSON(w, http.StatusOK, access)
+}
+
+func (h *SurveyHandlers) StartSurvey(w http.ResponseWriter, r *http.Request) {
+	request, err := httpx.ReadBody[domains.SurveyStartRequest](*r)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if request.Token == "" {
+		httpx.Error(w, http.StatusBadRequest, "token is required")
+		return
+	}
+
+	result, err := h.service.StartSurveyByToken(r.Context(), request)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrSurveyTokenInvalid):
+			httpx.Error(w, http.StatusUnauthorized, "Недействительный токен")
+		case errors.Is(err, service.ErrSurveyTokenExpired):
+			httpx.Error(w, http.StatusGone, "Срок действия токена истек")
+		case errors.Is(err, service.ErrSurveyTokenUsed):
+			httpx.Error(w, http.StatusForbidden, "Лимит использования токена исчерпан")
+		case errors.Is(err, storage.ErrNotFound):
+			httpx.Error(w, http.StatusNotFound, "Участник не найден")
+		default:
+			slog.Error("StartSurvey failed", "err", err)
+			httpx.Error(w, http.StatusInternalServerError, "Не удалось начать прохождение анкеты")
+		}
+		return
+	}
+
+	httpx.JSON(w, http.StatusOK, result)
+}
+
+func (h *SurveyHandlers) ExtendEnrollmentToken(w http.ResponseWriter, r *http.Request) {
+	participantSurveyID := httpx.GetId(w, r)
+	if participantSurveyID == 0 {
+		return
+	}
+
+	ownerID, ok := httpx.UserIdFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	req, err := httpx.ReadBody[domains.EnrollmentTokenUpdate](*r)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if req.EnrollmentID == 0 {
+		httpx.Error(w, http.StatusBadRequest, "enrollmentId is required")
+		return
+	}
+
+	result, err := h.service.ExtendEnrollmentToken(r.Context(), ownerID, int(participantSurveyID), req)
+	if err != nil {
+		switch {
+		case errors.Is(err, storage.ErrNotFound):
+			httpx.Error(w, http.StatusNotFound, "Участник не найден")
+		case errors.Is(err, service.ErrSurveyTokenInvalid):
+			httpx.Error(w, http.StatusBadRequest, "Некорректное время истечения")
+		default:
+			slog.Error("ExtendEnrollmentToken failed", "err", err)
+			httpx.Error(w, http.StatusInternalServerError, "Не удалось обновить токен участника")
+		}
+		return
+	}
+
+	httpx.JSON(w, http.StatusOK, result)
 }
 
 func (h *SurveyHandlers) SubmitSurveyResponse(w http.ResponseWriter, r *http.Request) {
@@ -331,7 +405,6 @@ func (h *SurveyHandlers) UpdateSurveyById(w http.ResponseWriter, r *http.Request
 	if surveyID == 0 {
 		return
 	}
-
 	ownerID, ok := httpx.UserIdFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "Unauthorized")
@@ -343,8 +416,9 @@ func (h *SurveyHandlers) UpdateSurveyById(w http.ResponseWriter, r *http.Request
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
+	slog.Info("payload", payload)
 	updated, err := h.service.UpdateSurvey(r.Context(), ownerID, int(surveyID), payload)
+	slog.Info("asddfasdf")
 	if err != nil {
 		switch {
 		case errors.Is(err, service.ErrSurveyScheduleInvalid):

@@ -1,6 +1,7 @@
 package domains
 
 import (
+	"bytes"
 	"encoding/json"
 	"time"
 )
@@ -34,17 +35,17 @@ type SurveyCreate struct {
 }
 
 type SurveyUpdate struct {
-	Title           *string        `json:"title,omitempty"`
-	Mode            *string        `json:"invitationMode,omitempty"`
-	Status          *string        `json:"status,omitempty"`
-	MaxParticipants OptionalInt    `json:"max_participants"`
-	PublicSlug      OptionalString `json:"public_slug"`
-	StartsAt        OptionalTime   `json:"starts_at"`
-	EndsAt          OptionalTime   `json:"ends_at"`
+	Title           *string     `json:"title,omitempty"`
+	Mode            *string     `json:"invitationMode,omitempty"`
+	Status          *string     `json:"status,omitempty"`
+	MaxParticipants OptionalInt `json:"max_participants"`
+	PublicSlug      *string     `json:"public_slug"`
+	StartsAt        *time.Time  `json:"starts_at"`
+	EndsAt          *time.Time  `json:"ends_at"`
 }
 
 func (u SurveyUpdate) HasChanges() bool {
-	return u.Title != nil || u.Mode != nil || u.Status != nil || u.MaxParticipants.Present || u.PublicSlug.Present || u.StartsAt.Present || u.EndsAt.Present
+	return u.Title != nil || u.Mode != nil || u.Status != nil || u.MaxParticipants.Present || u.PublicSlug != nil || u.StartsAt != nil || u.EndsAt != nil
 }
 
 type SurveyToSave struct {
@@ -91,9 +92,14 @@ type EnrollmentTokenPayload struct {
 	SurveyEndsAt   *time.Time
 }
 
-type OptionalTime struct {
-	Present bool
-	Value   *time.Time
+type EnrollmentTokenUpdate struct {
+	EnrollmentID int64     `json:"enrollmentId"`
+	ExpiresAt    time.Time `json:"expires_at"`
+}
+
+type EnrollmentTokenUpdateResult struct {
+	EnrollmentID int64      `json:"enrollment_id"`
+	ExpiresAt    *time.Time `json:"expires_at,omitempty"`
 }
 
 type OptionalInt struct {
@@ -101,15 +107,30 @@ type OptionalInt struct {
 	Value   *int
 }
 
-type OptionalString struct {
-	Present bool
-	Value   *string
+func (o *OptionalInt) UnmarshalJSON(data []byte) error {
+	o.Present = true
+	trimmed := bytes.TrimSpace(data)
+	if bytes.Equal(trimmed, []byte("null")) {
+		o.Value = nil
+		return nil
+	}
+	var parsed int
+	if err := json.Unmarshal(trimmed, &parsed); err != nil {
+		return err
+	}
+	o.Value = &parsed
+	return nil
 }
 
 type EnrollmentTokenGenerator func(payload EnrollmentTokenPayload) (token string, hash []byte, expiresAt time.Time, err error)
 
 type SurveyAccessRequest struct {
 	Token string `json:"token"`
+}
+
+type SurveyStartRequest struct {
+	Token   string `json:"token"`
+	Channel string `json:"channel,omitempty"`
 }
 
 type Enrollment struct {

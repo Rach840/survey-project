@@ -72,6 +72,12 @@ type SurveyResponseResult struct {
 	Answers  []SurveyAnswer `json:"answers"`
 }
 
+type SurveyStartResponse struct {
+	Survey     Survey         `json:"survey"`
+	Enrollment Enrollment     `json:"enrollment"`
+	Response   SurveyResponse `json:"response"`
+}
+
 type SurveyResult struct {
 	Survey     Survey         `json:"survey"`
 	Enrollment Enrollment     `json:"enrollment"`

@@ -8,13 +8,10 @@ import (
 	"net/http"
 
 	"github.com/gorilla/mux"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func Router(db *pgxpool.Pool, cfg *config.Config) *mux.Router {
+func Router(allProviders *providers.Providers, cfg *config.Config) *mux.Router {
 	router := mux.NewRouter()
-
-	allProviders := providers.New(db)
 	authService := service.NewAuthService(allProviders.AuthProvider, cfg.JWT.Secret)
 	templateService := service.NewTemplateService(allProviders.TemplateProvider)
 	surveyService := service.NewSurveyService(allProviders.SurveyProvider, allProviders.TemplateProvider, cfg.JWT.Secret)
@@ -40,6 +37,7 @@ func Router(db *pgxpool.Pool, cfg *config.Config) *mux.Router {
 
 	surveyPublic := api.PathPrefix("/survey").Subrouter()
 	surveyPublic.HandleFunc("/access", surveyHandler.AccessSurveyByToken).Methods(http.MethodPost, http.MethodGet)
+	surveyPublic.HandleFunc("/start", surveyHandler.StartSurvey).Methods(http.MethodPost)
 	surveyPublic.HandleFunc("/response", surveyHandler.SubmitSurveyResponse).Methods(http.MethodPost)
 	surveyPublic.HandleFunc("/response", surveyHandler.GetSurveyResult).Methods(http.MethodGet)
 
@@ -54,6 +52,7 @@ func Router(db *pgxpool.Pool, cfg *config.Config) *mux.Router {
 	survey.HandleFunc("/{id}/results", surveyHandler.GetSurveyResults).Methods(http.MethodGet)
 	survey.HandleFunc("/{id}", surveyHandler.GetSurveyById).Methods(http.MethodGet)
 	survey.HandleFunc("/{id}", surveyHandler.UpdateSurveyById).Methods(http.MethodPatch)
+	survey.HandleFunc("/{id}/participants/token", surveyHandler.ExtendEnrollmentToken).Methods(http.MethodPatch)
 
 	return router
 }

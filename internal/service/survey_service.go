@@ -34,10 +34,15 @@ type SurveyProvider interface {
 	RemoveEnrollment(ctx context.Context, surveyID, ownerID, enrollmentID int64) error
 	UpdateSurvey(ctx context.Context, surveyID, ownerID int64, update domains.SurveyUpdate) (domains.Survey, error)
 	SubmitSurveyResponse(ctx context.Context, payload domains.SurveyResponseToSave) (domains.SurveyResponseResult, error)
+	StartSurveyResponse(ctx context.Context, surveyID, enrollmentID int64, channel string) (domains.SurveyResponse, error)
 	GetSurveyResultByEnrollmentID(ctx context.Context, enrollmentID int64) (domains.SurveyResponseResult, error)
 	ListSurveyResults(ctx context.Context, ownerID int64, surveyID int64) ([]domains.SurveyResult, error)
 	GetSurveyStatistics(ctx context.Context, ownerID int64, surveyID int64) (domains.SurveyStatisticsCounts, error)
 	GetEnrollmentByID(ctx context.Context, enrollmentID int) (domains.Enrollment, error)
+	HasIncompleteEnrollments(ctx context.Context, surveyID int64) (bool, error)
+	ActivateScheduledSurveys(ctx context.Context, now time.Time) (int64, error)
+	ArchiveExpiredSurveys(ctx context.Context, now time.Time) (int64, error)
+	UpdateEnrollmentExpiry(ctx context.Context, enrollmentID int64, expiresAt time.Time) error
 }
 
 func NewSurveyService(provider SurveyProvider, templates TemplateProvider, secret string) *SurveyService {
@@ -72,14 +77,19 @@ func (h *SurveyService) CreateSurvey(ctx context.Context, payload domains.Survey
 	if status == "" {
 		status = "draft"
 	}
+	now := time.Now()
+	if shouldOpenOnCreate(payload.StartsAt, now) && status != "closed" && status != "archived" {
+		status = "open"
+	}
 	title := payload.Title
 	if title == "" {
 		title = template.Title
 	}
+
 	if payload.StartsAt != nil && payload.EndsAt != nil && (payload.EndsAt.Equal(*payload.StartsAt) || payload.EndsAt.Before(*payload.StartsAt)) {
 		return domains.SurveyCreateResult{}, ErrSurveyScheduleInvalid
 	}
-	if payload.EndsAt != nil && payload.EndsAt.Before(time.Now()) {
+	if payload.EndsAt != nil && payload.EndsAt.Before(now) {
 		return domains.SurveyCreateResult{}, ErrSurveyScheduleInvalid
 	}
 
@@ -175,14 +185,15 @@ func (h *SurveyService) UpdateSurvey(ctx context.Context, ownerID int, surveyID 
 	}
 
 	updatedStarts := existing.StartsAt
-	if update.StartsAt.Present {
-		updatedStarts = update.StartsAt.Value
+	if update.StartsAt != nil {
+		start := update.StartsAt.UTC()
+		updatedStarts = &start
 	}
 	updatedEnds := existing.EndsAt
-	if update.EndsAt.Present {
-		updatedEnds = update.EndsAt.Value
+	if update.EndsAt != nil {
+		end := update.EndsAt.UTC()
+		updatedEnds = &end
 	}
-
 	if updatedStarts != nil && updatedEnds != nil && (updatedEnds.Equal(*updatedStarts) || updatedEnds.Before(*updatedStarts)) {
 		return domains.Survey{}, ErrSurveyScheduleInvalid
 	}
@@ -201,7 +212,58 @@ func (h *SurveyService) UpdateSurvey(ctx context.Context, ownerID int, surveyID 
 		}
 	}
 
+	if update.EndsAt != nil {
+		target := update.EndsAt.UTC()
+		if existing.EndsAt == nil || !existing.EndsAt.Equal(target) {
+			if err := h.extendSurveyTokens(ctx, result, target); err != nil {
+				slog.Error("extendSurveyTokens failed", "err", err, "survey_id", surveyID)
+			}
+		}
+	}
+
 	return result, nil
+}
+
+func (h *SurveyService) ExtendEnrollmentToken(ctx context.Context, ownerID int, surveyID int, update domains.EnrollmentTokenUpdate) (domains.EnrollmentTokenUpdateResult, error) {
+	slog.Info("ExtendEnrollmentToken", "owner_id", ownerID, "survey_id", surveyID, "enrollment_id", update.EnrollmentID, "expires_at", update.ExpiresAt)
+	if update.EnrollmentID == 0 {
+		return domains.EnrollmentTokenUpdateResult{}, ErrSurveyTokenInvalid
+	}
+
+	expiresAt := update.ExpiresAt.UTC()
+	if expiresAt.Before(time.Now()) {
+		return domains.EnrollmentTokenUpdateResult{}, ErrSurveyTokenInvalid
+	}
+	slog.Info("expiresAt", expiresAt)
+	enrollment, err := h.provider.GetEnrollmentByID(ctx, int(update.EnrollmentID))
+	if err != nil {
+		slog.Error("ExtendEnrollmentToken get enrollment", "err", err, "enrollment_id", update.EnrollmentID)
+		if errors.Is(err, storage.ErrNotFound) {
+			return domains.EnrollmentTokenUpdateResult{}, storage.ErrNotFound
+		}
+		return domains.EnrollmentTokenUpdateResult{}, err
+	}
+	if enrollment.TokenHash == nil {
+		return domains.EnrollmentTokenUpdateResult{}, ErrSurveyTokenInvalid
+	}
+
+	if int64(surveyID) != enrollment.SurveyID {
+		return domains.EnrollmentTokenUpdateResult{}, storage.ErrNotFound
+	}
+
+	if _, err := h.provider.GetSurveyByID(ctx, ownerID, surveyID); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return domains.EnrollmentTokenUpdateResult{}, storage.ErrNotFound
+		}
+		return domains.EnrollmentTokenUpdateResult{}, err
+	}
+
+	if err := h.provider.UpdateEnrollmentExpiry(ctx, update.EnrollmentID, expiresAt); err != nil {
+		slog.Error("UpdateEnrollmentExpiry failed", "err", err, "enrollment_id", update.EnrollmentID)
+		return domains.EnrollmentTokenUpdateResult{}, err
+	}
+
+	return domains.EnrollmentTokenUpdateResult{EnrollmentID: update.EnrollmentID, ExpiresAt: &expiresAt}, nil
 }
 
 func (h *SurveyService) GetAllSurveysByUser(ctx context.Context, userId int) ([]domains.SurveySummary, error) {
@@ -367,6 +429,11 @@ func (h *SurveyService) SubmitSurveyResponse(ctx context.Context, submission dom
 	if access.Enrollment.State == "invited" || access.Enrollment.State == "pending" {
 		access.Enrollment.State = "approved"
 	}
+	if updatedSurvey, err := h.updateSurveyStatusOnSubmission(ctx, access.Survey); err != nil {
+		slog.Error("updateSurveyStatusOnSubmission failed", "err", err, "survey_id", access.Survey.ID)
+	} else {
+		access.Survey = updatedSurvey
+	}
 
 	return domains.SurveyResult{
 		Survey:     access.Survey,
@@ -437,6 +504,38 @@ func (h *SurveyService) AccessSurveyByToken(ctx context.Context, token string) (
 	return access, nil
 }
 
+func (h *SurveyService) StartSurveyByToken(ctx context.Context, request domains.SurveyStartRequest) (domains.SurveyStartResponse, error) {
+	if request.Token == "" {
+		return domains.SurveyStartResponse{}, ErrSurveyTokenInvalid
+	}
+
+	access, err := h.fetchSurveyAccess(ctx, request.Token)
+	if err != nil {
+		return domains.SurveyStartResponse{}, err
+	}
+	if err := ensureTokenUsable(access); err != nil {
+		return domains.SurveyStartResponse{}, err
+	}
+
+	channel := sanitizeResponseChannel(request.Channel)
+
+	response, err := h.provider.StartSurveyResponse(ctx, access.Survey.ID, access.Enrollment.ID, channel)
+	if err != nil {
+		slog.Error("StartSurveyResponse failed", "err", err, "enrollment_id", access.Enrollment.ID)
+		return domains.SurveyStartResponse{}, err
+	}
+
+	if access.Enrollment.State == "invited" {
+		access.Enrollment.State = "pending"
+	}
+
+	return domains.SurveyStartResponse{
+		Survey:     access.Survey,
+		Enrollment: access.Enrollment,
+		Response:   response,
+	}, nil
+}
+
 func (h *SurveyService) fetchSurveyAccess(ctx context.Context, token string) (domains.SurveyAccess, error) {
 	if token == "" {
 		return domains.SurveyAccess{}, ErrSurveyTokenInvalid
@@ -502,6 +601,64 @@ func ensureTokenUsable(access domains.SurveyAccess) error {
 		return ErrSurveyTokenUsed
 	}
 	return nil
+}
+
+func (h *SurveyService) updateSurveyStatusOnSubmission(ctx context.Context, survey domains.Survey) (domains.Survey, error) {
+	if survey.Status == "archived" || survey.Status == "closed" {
+		return survey, nil
+	}
+	incomplete, err := h.provider.HasIncompleteEnrollments(ctx, survey.ID)
+	if err != nil {
+		return survey, err
+	}
+	if incomplete {
+		return survey, nil
+	}
+	closed := "closed"
+	updated, err := h.provider.UpdateSurvey(ctx, survey.ID, survey.OwnerID, domains.SurveyUpdate{Status: &closed})
+	if err != nil {
+		return survey, err
+	}
+	return updated, nil
+}
+
+func shouldOpenOnCreate(startsAt *time.Time, now time.Time) bool {
+	if startsAt == nil {
+		return false
+	}
+	start := startsAt.In(now.Location())
+	current := now.In(now.Location())
+	return start.Year() == current.Year() && start.YearDay() == current.YearDay()
+}
+
+func (h *SurveyService) extendSurveyTokens(ctx context.Context, survey domains.Survey, expiresAt time.Time) error {
+	enrollments, err := h.provider.ListEnrollmentsBySurveyID(ctx, survey.OwnerID, survey.ID)
+	if err != nil {
+		return err
+	}
+	for _, enrollment := range enrollments {
+		if enrollment.TokenHash == nil {
+			continue
+		}
+		if !isEnrollmentTokenAllowed(enrollment.State) {
+			continue
+		}
+		if err := h.provider.UpdateEnrollmentExpiry(ctx, enrollment.ID, expiresAt); err != nil {
+			slog.Error("extendSurveyTokens update", "err", err, "enrollment_id", enrollment.ID)
+		}
+	}
+	return nil
+}
+
+func sanitizeResponseChannel(channel string) string {
+	switch channel {
+	case "web", "tg_webapp", "api":
+		return channel
+	case "":
+		return "web"
+	default:
+		return "web"
+	}
 }
 
 func isEnrollmentTokenAllowed(state string) bool {

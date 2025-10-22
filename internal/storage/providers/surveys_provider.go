@@ -207,11 +207,63 @@ func (s SurveyProvider) AddEnrollments(ctx context.Context, surveyID, ownerID in
 	}, nil
 }
 
+func (s SurveyProvider) StartSurveyResponse(ctx context.Context, surveyID, enrollmentID int64, channel string) (domains.SurveyResponse, error) {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return domains.SurveyResponse{}, fmt.Errorf("begin start response tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE enrollments
+		 SET state = CASE
+		     WHEN state = 'invited' THEN 'pending'
+		     ELSE state
+		 END
+		 WHERE id = $1`,
+		enrollmentID,
+	)
+	if err != nil {
+		return domains.SurveyResponse{}, fmt.Errorf("update enrollment state: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domains.SurveyResponse{}, fmt.Errorf("update enrollment state: %w", storage.ErrNotFound)
+	}
+
+	var channelValue interface{}
+	if channel != "" {
+		channelValue = channel
+	}
+
+	const upsert = `
+		INSERT INTO responses (survey_id, enrollment_id, state, channel)
+		VALUES ($1,$2,'in_progress',$3)
+		ON CONFLICT (survey_id, enrollment_id) DO UPDATE
+		SET state = 'in_progress',
+		    channel = COALESCE(EXCLUDED.channel, responses.channel)
+		RETURNING id, survey_id, enrollment_id, state, channel, started_at, submitted_at`
+
+	row, err := tx.Query(ctx, upsert, surveyID, enrollmentID, channelValue)
+	if err != nil {
+		return domains.SurveyResponse{}, fmt.Errorf("start response upsert: %w", err)
+	}
+
+	response, err := pgx.CollectOneRow(row, pgx.RowToStructByName[domains.SurveyResponse])
+	if err != nil {
+		return domains.SurveyResponse{}, fmt.Errorf("start response upsert: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return domains.SurveyResponse{}, fmt.Errorf("commit start response: %w", err)
+	}
+
+	return response, nil
+}
+
 func (s SurveyProvider) UpdateSurvey(ctx context.Context, surveyID, ownerID int64, update domains.SurveyUpdate) (domains.Survey, error) {
 	setClauses := make([]string, 0, 7)
 	args := make([]interface{}, 0, 9)
 	idx := 1
-
 	if update.Title != nil {
 		setClauses = append(setClauses, fmt.Sprintf("title = $%d", idx))
 		args = append(args, *update.Title)
@@ -236,39 +288,25 @@ func (s SurveyProvider) UpdateSurvey(ctx context.Context, surveyID, ownerID int6
 		}
 		idx++
 	}
-	if update.PublicSlug.Present {
+	if update.PublicSlug != nil {
 		setClauses = append(setClauses, fmt.Sprintf("public_slug = $%d", idx))
-		if update.PublicSlug.Value != nil {
-			args = append(args, *update.PublicSlug.Value)
-		} else {
-			args = append(args, nil)
-		}
+		args = append(args, *update.PublicSlug)
 		idx++
 	}
-	if update.StartsAt.Present {
+	if update.StartsAt != nil {
 		setClauses = append(setClauses, fmt.Sprintf("starts_at = $%d", idx))
-		if update.StartsAt.Value != nil {
-			args = append(args, *update.StartsAt.Value)
-		} else {
-			args = append(args, nil)
-		}
+		args = append(args, update.StartsAt.UTC())
 		idx++
 	}
-	if update.EndsAt.Present {
+	if update.EndsAt != nil {
 		setClauses = append(setClauses, fmt.Sprintf("ends_at = $%d", idx))
-		if update.EndsAt.Value != nil {
-			args = append(args, *update.EndsAt.Value)
-		} else {
-			args = append(args, nil)
-		}
+		args = append(args, update.EndsAt.UTC())
 		idx++
 	}
 
 	if len(setClauses) == 0 {
 		return s.GetSurveyByID(ctx, int(ownerID), int(surveyID))
 	}
-
-	setClauses = append(setClauses, "updated_at = now()")
 	args = append(args, surveyID, ownerID)
 	query := fmt.Sprintf(`
 		UPDATE surveys
@@ -329,7 +367,7 @@ func (s SurveyProvider) GetAllSurveysByUser(ctx context.Context, userId int64) (
 				AVG(EXTRACT(EPOCH FROM (r.submitted_at - r.started_at))) AS avg_completion_seconds
 			FROM enrollments e
 			LEFT JOIN responses r ON r.enrollment_id = e.id
-			WHERE e.survey_id = s.id
+			WHERE e.survey_id = s.id AND e.state IS DISTINCT FROM 'removed'
 		) AS stats ON true
 		WHERE s.owner_id = $1
 		ORDER BY s.created_at DESC`
@@ -466,7 +504,7 @@ func (s SurveyProvider) ListEnrollmentsBySurveyID(ctx context.Context, ownerID i
 			e.used_count
 		FROM enrollments e
 		JOIN surveys s ON s.id = e.survey_id
-		WHERE s.owner_id = $1 AND e.survey_id = $2
+		WHERE s.owner_id = $1 AND e.survey_id = $2 
 		ORDER BY e.id`
 
 	rows, err := s.db.Query(ctx, query, ownerID, surveyID)
@@ -491,6 +529,27 @@ func (s SurveyProvider) UpdateEnrollmentToken(ctx context.Context, enrollmentID 
 	if _, err := s.db.Exec(ctx, query, hash, expiresAt, enrollmentID); err != nil {
 		return fmt.Errorf("update enrollment token: %w", err)
 	}
+	return nil
+}
+
+func (s SurveyProvider) UpdateEnrollmentExpiry(ctx context.Context, enrollmentID int64, expiresAt time.Time) error {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	const query = `
+		UPDATE enrollments
+		SET token_expires_at = $2
+		WHERE id = $1`
+	slog.Info("enrollmentID", enrollmentID, "expiresAt", expiresAt)
+	if _, err := tx.Exec(ctx, query, enrollmentID, expiresAt); err != nil {
+		return fmt.Errorf("update enrollment expiry: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil
+	}
+
 	return nil
 }
 
@@ -613,7 +672,7 @@ func (s SurveyProvider) GetSurveyResultByEnrollmentID(ctx context.Context, enrol
 	const query = `
 		SELECT id, survey_id, enrollment_id, state, channel, started_at, submitted_at
 		FROM responses
-		WHERE enrollment_id = $1
+		WHERE enrollment_id = $1 
 		LIMIT 1`
 
 	row, err := s.db.Query(ctx, query, enrollmentID)
@@ -851,7 +910,7 @@ func (s SurveyProvider) GetSurveyStatistics(ctx context.Context, ownerID int64, 
 			COUNT(*) FILTER (WHERE r.state = 'in_progress') AS responses_in_progress,
 			AVG(EXTRACT(EPOCH FROM (r.submitted_at - r.started_at))) FILTER (WHERE r.submitted_at IS NOT NULL) AS avg_completion_seconds
 		FROM surveys s
-		LEFT JOIN enrollments e ON e.survey_id = s.id
+		LEFT JOIN enrollments e ON e.survey_id = s.id AND e.state IS DISTINCT FROM 'removed'
 		LEFT JOIN responses r ON r.enrollment_id = e.id
 		WHERE s.owner_id = $1 AND s.id = $2`
 
@@ -878,6 +937,50 @@ func (s SurveyProvider) GetSurveyStatistics(ctx context.Context, ownerID int64, 
 	}
 
 	return stats, nil
+}
+
+func (s SurveyProvider) HasIncompleteEnrollments(ctx context.Context, surveyID int64) (bool, error) {
+	const query = `
+		SELECT EXISTS(
+			SELECT 1
+			FROM enrollments
+			WHERE survey_id = $1 AND state IN ('invited','pending')
+		)`
+	var exists bool
+	if err := s.db.QueryRow(ctx, query, surveyID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("has incomplete enrollments: %w", err)
+	}
+	return exists, nil
+}
+
+func (s SurveyProvider) ActivateScheduledSurveys(ctx context.Context, now time.Time) (int64, error) {
+	tag, err := s.db.Exec(ctx,
+		`UPDATE surveys
+		 SET status = 'open'
+		 WHERE status = 'draft'
+		   AND starts_at IS NOT NULL
+		   AND starts_at <= $1`,
+		now,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("activate scheduled surveys: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+func (s SurveyProvider) ArchiveExpiredSurveys(ctx context.Context, now time.Time) (int64, error) {
+	tag, err := s.db.Exec(ctx,
+		`UPDATE surveys
+		 SET status = 'archived'
+		 WHERE status IN ('open','closed')
+		   AND ends_at IS NOT NULL
+		   AND ends_at <= $1`,
+		now,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("archive expired surveys: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 func (s SurveyProvider) GetEnrollmentByID(ctx context.Context, enrollmentID int) (domains.Enrollment, error) {
 	slog.Info("enrollmentID", enrollmentID)
