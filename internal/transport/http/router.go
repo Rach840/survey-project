@@ -15,9 +15,11 @@ func Router(allProviders *providers.Providers, cfg *config.Config) *mux.Router {
 	authService := service.NewAuthService(allProviders.AuthProvider, cfg.JWT.Secret)
 	templateService := service.NewTemplateService(allProviders.TemplateProvider)
 	surveyService := service.NewSurveyService(allProviders.SurveyProvider, allProviders.TemplateProvider, cfg.JWT.Secret)
+	userService := service.NewUserService(allProviders.UserProvider)
 	authHandler := NewAuthHandlers(authService)
 	templateHandler := NewTemplateHandlers(templateService)
 	surveyHandler := NewSurveyHandlers(surveyService)
+	userHandler := NewUserHandlers(userService)
 
 	api := router.PathPrefix("/api").Subrouter()
 
@@ -26,6 +28,11 @@ func Router(allProviders *providers.Providers, cfg *config.Config) *mux.Router {
 	auth.HandleFunc("/register", authHandler.RegisterQuestioner).Methods(http.MethodPost)
 	auth.HandleFunc("/refresh", authHandler.Refresh).Methods(http.MethodPost)
 	auth.HandleFunc("/me", authHandler.Me).Methods(http.MethodGet)
+
+	user := api.PathPrefix("/user").Subrouter()
+	//user.Use(httpx.Protected(cfg.JWT.Secret))po
+	//user.Use(httpx.Questioner(*allProviders.AuthProvider))
+	user.HandleFunc("/", userHandler.GetAllUsers).Methods(http.MethodGet)
 
 	template := api.PathPrefix("/template").Subrouter()
 	template.Use(httpx.Protected(cfg.JWT.Secret))
