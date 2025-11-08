@@ -20,7 +20,6 @@ type AuthService struct {
 }
 
 type AuthProvider interface {
-	SaveUser(ctx context.Context, passHash string, userData domains.Questioner) error
 	GetUserByEmail(ctx context.Context, email string) (domains.Questioner, error)
 	GetUserByID(ctx context.Context, ID int) (domains.Questioner, error)
 }
@@ -79,22 +78,6 @@ func (s *AuthService) GenerateTokens(user domains.Questioner) (accessToken strin
 	}
 
 	return accessToken, refreshToken, nil
-}
-
-func (s *AuthService) Register(ctx context.Context, userData domains.Questioner) error {
-	passHash, err := bcrypt.GenerateFromPassword([]byte(userData.Password), bcrypt.DefaultCost)
-	if err != nil {
-		slog.Error("Create hash pass error", err.Error())
-		return err
-	}
-
-	err = s.provider.SaveUser(ctx, string(passHash), userData)
-	if err != nil {
-		slog.Error("Save user error", err.Error())
-		return err
-	}
-
-	return nil
 }
 
 func (s *AuthService) Refresh(ctx context.Context, refreshToken string) (string, string, error) {

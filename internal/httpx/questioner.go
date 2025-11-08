@@ -2,6 +2,7 @@ package httpx
 
 import (
 	"context"
+	"log/slog"
 	"mymodule/internal/domains"
 	"mymodule/internal/storage/providers"
 	"net/http"
@@ -24,6 +25,7 @@ func Questioner(provider providers.AuthProvider) mux.MiddlewareFunc {
 				Error(w, http.StatusUnauthorized, "Unauthorized")
 				return
 			}
+			slog.Info("user", user)
 			ctx := context.WithValue(r.Context(), questionerContextKey, user)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})

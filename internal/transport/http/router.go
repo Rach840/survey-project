@@ -25,14 +25,14 @@ func Router(allProviders *providers.Providers, cfg *config.Config) *mux.Router {
 
 	auth := api.PathPrefix("/auth").Subrouter()
 	auth.HandleFunc("/login", authHandler.Login).Methods(http.MethodPost)
-	auth.HandleFunc("/register", authHandler.RegisterQuestioner).Methods(http.MethodPost)
 	auth.HandleFunc("/refresh", authHandler.Refresh).Methods(http.MethodPost)
 	auth.HandleFunc("/me", authHandler.Me).Methods(http.MethodGet)
 
 	user := api.PathPrefix("/user").Subrouter()
-	//user.Use(httpx.Protected(cfg.JWT.Secret))po
-	//user.Use(httpx.Questioner(*allProviders.AuthProvider))
+	user.Use(httpx.Protected(cfg.JWT.Secret))
+	user.Use(httpx.Admin(*allProviders.AuthProvider))
 	user.HandleFunc("/", userHandler.GetAllUsers).Methods(http.MethodGet)
+	user.HandleFunc("/create", userHandler.CreateUser).Methods(http.MethodPost)
 
 	template := api.PathPrefix("/template").Subrouter()
 	template.Use(httpx.Protected(cfg.JWT.Secret))

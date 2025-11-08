@@ -8,7 +8,6 @@ import (
 	"mymodule/internal/domains"
 	"mymodule/internal/httpx"
 	"mymodule/internal/service"
-	"mymodule/internal/storage"
 	"net/http"
 	"strings"
 )
@@ -17,7 +16,6 @@ type AuthHandlers struct {
 	service AuthServices
 }
 type AuthServices interface {
-	Register(ctx context.Context, user domains.Questioner) error
 	Login(ctx context.Context, email string, password string) (string, string, error)
 	Refresh(ctx context.Context, token string) (string, string, error)
 	Me(ctx context.Context, token string) (domains.Questioner, error)
@@ -27,29 +25,6 @@ func NewAuthHandlers(service AuthServices) *AuthHandlers {
 	return &AuthHandlers{
 		service: service,
 	}
-}
-
-func (srv AuthHandlers) RegisterQuestioner(w http.ResponseWriter, r *http.Request) {
-	slog.Info("RegisterQuestioner called")
-	userData, err := httpx.ReadBody[domains.Questioner](*r)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(err.Error()))
-		return
-	}
-	ctx := r.Context()
-
-	if err := srv.service.Register(ctx, userData); err != nil {
-		if errors.Is(err, storage.ErrUserExist) {
-			http.Error(w, "Ошибка", http.StatusConflict)
-			return
-		}
-		http.Error(w, "Ошибка", http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusCreated)
-	return
 }
 
 func (srv AuthHandlers) Login(w http.ResponseWriter, r *http.Request) {

@@ -11,10 +11,10 @@ import (
 
 func Start(ctx context.Context, addr string, handler http.Handler) error {
 	c := cors.New(cors.Options{
-		AllowedOrigins:   []string{"http://localhost:3000"}, // 👈 Укажи твой фронтенд-адрес
+		AllowedOrigins:   []string{"http://localhost:3000"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Content-Type", "Authorization"},
-		AllowCredentials: true, // 👈 Обязательно при работе с cookie или авторизацией
+		AllowCredentials: true,
 	})
 	handlerWithCors := c.Handler(handler)
 	srv := &http.Server{

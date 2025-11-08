@@ -19,11 +19,11 @@ func Admin(provider providers.AuthProvider) mux.MiddlewareFunc {
 				return
 			}
 			user, err := provider.GetUserByID(r.Context(), sub)
-			if err != nil {
-				Error(w, http.StatusUnauthorized, "Unauthorized")
+			if err != nil || user.Role != "ADMIN" {
+				Error(w, http.StatusUnauthorized, "Нет прав")
 				return
 			}
-			ctx := context.WithValue(r.Context(), questionerContextKey, user)
+			ctx := context.WithValue(r.Context(), adminContextKey, user)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
