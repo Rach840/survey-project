@@ -31,8 +31,7 @@ func (srv AuthHandlers) Login(w http.ResponseWriter, r *http.Request) {
 	slog.Info("Login called")
 	loginData, err := httpx.ReadBody[LoginData](*r)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(err.Error()))
+		httpx.Error(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 	accessToken, refreshToken, err := srv.service.Login(r.Context(), loginData.Email, loginData.Password)
@@ -40,8 +39,10 @@ func (srv AuthHandlers) Login(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, service.PasswordIncorrect) {
 			httpx.Error(w, http.StatusBadRequest, "Пароль не верный")
+			return
 		}
 		httpx.Error(w, http.StatusBadRequest, "Ошибка сервера")
+		return
 	}
 
 	httpx.JSON(w, http.StatusOK, struct {
